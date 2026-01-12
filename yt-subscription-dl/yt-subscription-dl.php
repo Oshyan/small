@@ -3,7 +3,7 @@ header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Pragma: no-cache');
 header('Expires: 0');
 if (function_exists('opcache_invalidate')) { @opcache_invalidate(__FILE__, true); }
-define('BUILD_TAG', 'yt-web v1.6'); // sanity marker
+define('BUILD_TAG', 'yt-web v2.0'); // sanity marker - AJAX-based progress
 /**
  * Web GUI for YouTube → Google Sheet backfill/update (Folder ID validated, live progress)
  * - Start & End dates (interpreted in America/Los_Angeles)
@@ -38,7 +38,7 @@ $YT_BASE_DELAY_MS      = 150;
 $MAX_BACKOFF_ATTEMPTS  = 6;
 $BACKOFF_BASE_SECONDS  = 1.5;
 $CHANNEL_FLUSH_CHUNK   = 400;
-$SOFT_TIME_GUARD_SEC   = 60;
+$CHANNELS_PER_BATCH    = 5;  // Process this many channels per AJAX call
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AJAX: Validate folder ID
@@ -73,6 +73,457 @@ if (isset($_GET['action']) && $_GET['action'] === 'validateFolder') {
     echo json_encode(['valid' => false, 'error' => 'Error checking folder']);
   }
   exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AJAX: Process a batch of channels (called repeatedly by progress page)
+// ─────────────────────────────────────────────────────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'process') {
+  header('Content-Type: application/json');
+
+  $stateKey = $_GET['stateKey'] ?? '';
+  if (!$stateKey) {
+    echo json_encode(['error' => 'Missing stateKey']);
+    exit;
+  }
+
+  $stateAll = loadState();
+  if (!isset($stateAll[$stateKey])) {
+    echo json_encode(['error' => 'Invalid or expired state']);
+    exit;
+  }
+
+  $state = $stateAll[$stateKey];
+  $subs = $state['subs'] ?? [];
+  $total = $state['total'] ?? 0;
+  $nextIndex = $state['nextIndex'] ?? 0;
+  $spreadsheetId = $state['spreadsheetId'] ?? '';
+  $sinceTsUtc = $state['sinceTsUtc'] ?? 0;
+  $endTsUtc = $state['endTsUtc'] ?? null;
+  $uploadsMap = $state['uploadsMap'] ?? [];
+  $processedTotal = $state['processedTotal'] ?? 0;
+
+  if (!$spreadsheetId || empty($subs)) {
+    echo json_encode(['error' => 'Invalid state data']);
+    exit;
+  }
+
+  // Check if already complete
+  if ($nextIndex >= $total) {
+    echo json_encode([
+      'complete' => true,
+      'channelIndex' => $total,
+      'totalChannels' => $total,
+      'totalVideos' => $processedTotal,
+      'spreadsheetUrl' => "https://docs.google.com/spreadsheets/d/$spreadsheetId"
+    ]);
+    exit;
+  }
+
+  try {
+    $client = getClient([
+      'https://www.googleapis.com/auth/youtube.readonly',
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/drive'
+    ]);
+    $yt = new YouTube($client);
+    $sh = new Sheets($client);
+
+    // Get existing IDs for deduplication
+    $existingIds = getExistingVideoIds($sh, $spreadsheetId, SHEET_DATA);
+
+    // Process up to CHANNELS_PER_BATCH channels
+    $batchEnd = min($nextIndex + $CHANNELS_PER_BATCH, $total);
+    $batchResults = [];
+
+    for ($i = $nextIndex; $i < $batchEnd; $i++) {
+      $sub = $subs[$i];
+      $cid = $sub['channelId'];
+      $ctitle = $sub['channelTitle'] ?: $cid;
+
+      $uploadsId = $uploadsMap[$cid] ?? null;
+      if (!$uploadsId) {
+        $batchResults[] = ['channel' => $ctitle, 'videos' => 0, 'skipped' => true];
+        continue;
+      }
+
+      $channelVideos = processChannelVideos(
+        $yt, $sh, $spreadsheetId, $uploadsId, $cid, $ctitle,
+        $sinceTsUtc, $endTsUtc, $existingIds,
+        $WRITE_MIN_INTERVAL_MS, $YT_BASE_DELAY_MS, $MAX_BACKOFF_ATTEMPTS, $BACKOFF_BASE_SECONDS, $CHANNEL_FLUSH_CHUNK
+      );
+
+      $processedTotal += $channelVideos;
+      $batchResults[] = ['channel' => $ctitle, 'videos' => $channelVideos];
+
+      // Update existing IDs for next channel in batch
+      // (the function updates existingIds by reference via getExistingVideoIds pattern)
+    }
+
+    // Update state
+    $state['nextIndex'] = $batchEnd;
+    $state['processedTotal'] = $processedTotal;
+    $stateAll[$stateKey] = $state;
+    saveState($stateAll);
+
+    $complete = ($batchEnd >= $total);
+
+    if ($complete) {
+      progress($sh, $spreadsheetId, 'Complete', 'All subscriptions processed', '', $WRITE_MIN_INTERVAL_MS);
+    }
+
+    echo json_encode([
+      'complete' => $complete,
+      'channelIndex' => $batchEnd,
+      'totalChannels' => $total,
+      'totalVideos' => $processedTotal,
+      'batchResults' => $batchResults,
+      'spreadsheetUrl' => "https://docs.google.com/spreadsheets/d/$spreadsheetId"
+    ]);
+
+  } catch (Exception $e) {
+    echo json_encode(['error' => 'Processing error: ' . $e->getMessage()]);
+  }
+  exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Progress page (shows UI and polls process endpoint)
+// ─────────────────────────────────────────────────────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'progress') {
+  $stateKey = $_GET['stateKey'] ?? '';
+  $stateAll = loadState();
+
+  if (!$stateKey || !isset($stateAll[$stateKey])) {
+    die('<!doctype html><html><body><h2>Error</h2><p>Invalid or expired session. <a href="?">Start over</a></p></body></html>');
+  }
+
+  $state = $stateAll[$stateKey];
+  $sheetName = $state['sheetName'] ?? 'Unknown';
+  $startDate = $state['startDate'] ?? '';
+  $endDate = $state['endDate'] ?? '';
+  $updateOnly = $state['updateOnly'] ?? false;
+  $spreadsheetId = $state['spreadsheetId'] ?? '';
+  $spreadsheetUrl = $spreadsheetId ? "https://docs.google.com/spreadsheets/d/$spreadsheetId" : '';
+  $total = $state['total'] ?? 0;
+  $nextIndex = $state['nextIndex'] ?? 0;
+  $processedTotal = $state['processedTotal'] ?? 0;
+
+  outputProgressPage($stateKey, $sheetName, $startDate, $endDate, $updateOnly, $spreadsheetUrl, $total, $nextIndex, $processedTotal);
+  exit;
+}
+
+/**
+ * Process videos for a single channel - extracted for batch processing
+ */
+function processChannelVideos(
+  YouTube $yt, Sheets $sh, string $spreadsheetId, string $uploadsId, string $cid, string $ctitle,
+  int $sinceTsUtc, ?int $endTsUtc, array &$existingIds,
+  int $writeMinMs, int $ytPauseMs, int $maxBackoff, float $backoffBase, int $flushChunk
+): int {
+  global $HEADER;
+  $pageToken = null;
+  $monotonic = true;
+  $pendingVideos = [];
+  $processedRows = 0;
+
+  do {
+    try {
+      $resp = callWithBackoff(function() use($yt, $uploadsId, $pageToken) {
+        return $yt->playlistItems->listPlaylistItems('snippet,contentDetails', [
+          'playlistId' => $uploadsId, 'maxResults' => 50, 'pageToken' => $pageToken
+        ]);
+      }, $maxBackoff, $backoffBase);
+    } catch (Google\Service\Exception $e) {
+      if ($e->getCode() === 404 && strpos($e->getMessage(), 'playlistId') !== false) {
+        return 0; // Playlist not found, skip
+      }
+      throw $e;
+    }
+
+    if (!$resp) break;
+    $items = $resp->getItems();
+    if (!$items || !count($items)) break;
+
+    usleep($ytPauseMs * 1000);
+
+    $prevTs = null;
+    $oldestTsInPage = null;
+
+    foreach ($items as $it) {
+      $sn = $it->getSnippet();
+      $cd = $it->getContentDetails();
+      $videoId = $cd ? $cd->getVideoId() : null;
+
+      $publishedIso = null;
+      if ($cd && $cd->getVideoPublishedAt()) $publishedIso = $cd->getVideoPublishedAt();
+      elseif ($sn && $sn->getPublishedAt()) $publishedIso = $sn->getPublishedAt();
+      if (!$videoId || !$publishedIso) continue;
+
+      $pubTs = strtotime($publishedIso);
+      if ($prevTs !== null && $pubTs > $prevTs) $monotonic = false;
+      $prevTs = $pubTs;
+      if ($oldestTsInPage === null || $pubTs < $oldestTsInPage) $oldestTsInPage = $pubTs;
+
+      // Filter by date window
+      if ($pubTs < $sinceTsUtc) continue;
+      if ($endTsUtc && $pubTs > $endTsUtc) continue;
+
+      if (!isset($existingIds[$videoId])) {
+        $existingIds[$videoId] = true;
+        $title = ($sn && $sn->getTitle()) ? $sn->getTitle() : 'Open';
+        $channelTitle = ($sn && $sn->getChannelTitle()) ? $sn->getChannelTitle() : '';
+        $pendingVideos[$videoId] = [
+          'channelTitle' => $channelTitle,
+          'title' => $title,
+          'pubTs' => $pubTs,
+          'cid' => $cid
+        ];
+      }
+    }
+
+    $early = $monotonic && $oldestTsInPage !== null && $oldestTsInPage < $sinceTsUtc;
+    $pageToken = $early ? null : $resp->getNextPageToken();
+
+    // Flush pending videos in batches
+    if (count($pendingVideos) >= $flushChunk) {
+      $videoDetails = fetchVideoDetails($yt, array_keys($pendingVideos), $ytPauseMs);
+      $channelRows = buildVideoRows($pendingVideos, $videoDetails);
+      appendRows($sh, $spreadsheetId, SHEET_DATA, $channelRows, $writeMinMs);
+      $processedRows += count($channelRows);
+      $pendingVideos = [];
+    }
+
+  } while ($pageToken);
+
+  // Flush any remaining videos
+  if (!empty($pendingVideos)) {
+    $videoDetails = fetchVideoDetails($yt, array_keys($pendingVideos), $ytPauseMs);
+    $channelRows = buildVideoRows($pendingVideos, $videoDetails);
+    appendRows($sh, $spreadsheetId, SHEET_DATA, $channelRows, $writeMinMs);
+    $processedRows += count($channelRows);
+  }
+
+  return $processedRows;
+}
+
+/**
+ * Build spreadsheet rows from pending videos and their details
+ */
+function buildVideoRows(array $pendingVideos, array $videoDetails): array {
+  $rows = [];
+  foreach ($pendingVideos as $videoId => $info) {
+    $url = 'https://www.youtube.com/watch?v=' . $videoId;
+    $link = '=HYPERLINK("' . $url . '","' . escapeFormula($info['title']) . '")';
+    $details = $videoDetails[$videoId] ?? ['duration' => '?', 'seconds' => 0, 'isShort' => '?', 'isVertical' => '?'];
+    $rows[] = [
+      $info['channelTitle'],
+      $info['title'],
+      displayLocalFromTs($info['pubTs']),
+      $link,
+      $details['duration'],
+      $details['seconds'],
+      $details['isShort'],
+      $details['isVertical']
+    ];
+  }
+  return $rows;
+}
+
+/**
+ * Output the AJAX-based progress page
+ */
+function outputProgressPage(string $stateKey, string $sheetName, string $startDate, ?string $endDate, bool $updateOnly, string $spreadsheetUrl, int $total, int $nextIndex, int $processedTotal) {
+  ?>
+<!doctype html><html><head>
+<meta charset="utf-8">
+<title>Processing: <?=htmlspecialchars($sheetName)?></title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#f8fafc}
+.header{background:#fff;border-radius:12px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.header h2{margin:0 0 1rem}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.5rem;font-size:.9rem;color:#666}
+.meta span{background:#f1f5f9;padding:.5rem .75rem;border-radius:6px}
+.progress-box{background:#fff;border-radius:12px;padding:1.5rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.progress-bar{height:24px;background:#e2e8f0;border-radius:12px;overflow:hidden;margin:1rem 0}
+.progress-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#2563eb);transition:width .3s;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:.8rem;min-width:40px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:1rem 0}
+.stat{text-align:center;padding:1rem;background:#f8fafc;border-radius:8px}
+.stat-value{font-size:1.5rem;font-weight:700;color:#1e40af}
+.stat-label{font-size:.75rem;color:#64748b;text-transform:uppercase}
+.log{background:#1e293b;color:#e2e8f0;padding:1rem;border-radius:8px;font-family:ui-monospace,monospace;font-size:.85rem;max-height:400px;overflow-y:auto;margin-top:1rem}
+.log-entry{padding:.25rem 0;border-bottom:1px solid #334155}
+.log-entry:last-child{border:none}
+.log-channel{color:#60a5fa}
+.log-count{color:#4ade80}
+.log-skip{color:#94a3b8}
+.done{background:#d1fae5;color:#065f46;padding:1.5rem;border-radius:8px;margin-top:1rem;text-align:center}
+.done a{color:#065f46;font-weight:600}
+.error{background:#fee2e2;color:#991b1b;padding:1rem;border-radius:8px;margin-top:1rem}
+.paused{background:#fef3c7;color:#92400e;padding:1rem;border-radius:8px;margin-top:1rem;text-align:center}
+.btn{padding:.6rem 1.2rem;border:0;border-radius:8px;font-weight:600;cursor:pointer;margin:.25rem}
+.btn-primary{background:#0b57d0;color:#fff}
+.btn-secondary{background:#e2e8f0;color:#475569}
+.controls{margin-top:1rem;text-align:center}
+</style>
+</head><body>
+<div class="header">
+  <h2>YT Subscription Downloader</h2>
+  <div class="meta">
+    <span><strong>Sheet:</strong> <?=htmlspecialchars($sheetName)?></span>
+    <span><strong>Start:</strong> <?=htmlspecialchars($startDate)?></span>
+    <span><strong>End:</strong> <?=htmlspecialchars($endDate ?: 'Now')?></span>
+    <span><strong>Mode:</strong> <?=$updateOnly ? 'Update' : 'Backfill'?></span>
+  </div>
+  <?php if ($spreadsheetUrl): ?>
+  <p style="margin-top:1rem"><a href="<?=htmlspecialchars($spreadsheetUrl)?>" target="_blank">Open Spreadsheet →</a></p>
+  <?php endif; ?>
+</div>
+<div class="progress-box">
+  <div id="currentChannel">Initializing...</div>
+  <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%">0%</div></div>
+  <div class="stats">
+    <div class="stat"><div class="stat-value" id="statChannels">0/<?=$total?></div><div class="stat-label">Channels</div></div>
+    <div class="stat"><div class="stat-value" id="statVideos"><?=$processedTotal?></div><div class="stat-label">Videos Added</div></div>
+    <div class="stat"><div class="stat-value" id="statTime">0:00</div><div class="stat-label">Elapsed</div></div>
+  </div>
+  <div class="log" id="log"></div>
+  <div id="statusArea"></div>
+  <div class="controls" id="controls" style="display:none">
+    <button class="btn btn-primary" id="btnContinue">Continue Processing</button>
+    <button class="btn btn-secondary" id="btnPause">Pause</button>
+  </div>
+</div>
+
+<script>
+const stateKey = <?=json_encode($stateKey)?>;
+const startTime = Date.now();
+let isRunning = true;
+let isPaused = false;
+let totalChannels = <?=$total?>;
+let currentIndex = <?=$nextIndex?>;
+let totalVideos = <?=$processedTotal?>;
+
+// Update elapsed time
+setInterval(() => {
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  document.getElementById('statTime').textContent = mins + ':' + String(secs).padStart(2, '0');
+}, 1000);
+
+function updateUI(data) {
+  const pct = Math.round((data.channelIndex / data.totalChannels) * 100);
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('progressFill').textContent = pct + '%';
+  document.getElementById('statChannels').textContent = data.channelIndex + '/' + data.totalChannels;
+  document.getElementById('statVideos').textContent = data.totalVideos;
+
+  currentIndex = data.channelIndex;
+  totalVideos = data.totalVideos;
+  totalChannels = data.totalChannels;
+}
+
+function addLogEntries(results) {
+  const log = document.getElementById('log');
+  results.forEach(r => {
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    if (r.skipped) {
+      entry.innerHTML = '<span class="log-channel">[' + currentIndex + '/' + totalChannels + '] ' + escapeHtml(r.channel) + '</span> <span class="log-skip">(skipped)</span>';
+    } else {
+      entry.innerHTML = '<span class="log-channel">[' + currentIndex + '/' + totalChannels + '] ' + escapeHtml(r.channel) + '</span> <span class="log-count">+' + r.videos + ' videos</span>';
+    }
+    log.appendChild(entry);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function showComplete(data) {
+  document.getElementById('currentChannel').innerHTML = '<strong>Complete!</strong>';
+  document.getElementById('progressFill').style.width = '100%';
+  document.getElementById('progressFill').textContent = '100%';
+  document.getElementById('statusArea').innerHTML =
+    '<div class="done"><strong>Done!</strong> Added ' + data.totalVideos + ' videos.<br>' +
+    '<a href="' + data.spreadsheetUrl + '" target="_blank">Open Spreadsheet →</a></div>';
+  document.getElementById('controls').style.display = 'none';
+  isRunning = false;
+}
+
+function showError(msg) {
+  document.getElementById('statusArea').innerHTML =
+    '<div class="error"><strong>Error:</strong> ' + escapeHtml(msg) + '</div>';
+  document.getElementById('controls').style.display = 'block';
+  document.getElementById('btnPause').style.display = 'none';
+  isRunning = false;
+}
+
+function showPaused() {
+  document.getElementById('statusArea').innerHTML =
+    '<div class="paused">Processing paused. Click Continue to resume.</div>';
+  document.getElementById('controls').style.display = 'block';
+  document.getElementById('btnPause').style.display = 'none';
+}
+
+async function processBatch() {
+  if (!isRunning || isPaused) return;
+
+  document.getElementById('currentChannel').innerHTML = '<strong>Processing batch...</strong>';
+
+  try {
+    const resp = await fetch('?action=process&stateKey=' + encodeURIComponent(stateKey));
+    const data = await resp.json();
+
+    if (data.error) {
+      showError(data.error);
+      return;
+    }
+
+    updateUI(data);
+
+    if (data.batchResults) {
+      addLogEntries(data.batchResults);
+    }
+
+    if (data.complete) {
+      showComplete(data);
+    } else if (isRunning && !isPaused) {
+      // Small delay then process next batch
+      setTimeout(processBatch, 100);
+    }
+
+  } catch (err) {
+    showError('Network error: ' + err.message);
+  }
+}
+
+// Button handlers
+document.getElementById('btnContinue').addEventListener('click', () => {
+  isRunning = true;
+  isPaused = false;
+  document.getElementById('statusArea').innerHTML = '';
+  document.getElementById('controls').style.display = 'none';
+  document.getElementById('btnPause').style.display = '';
+  processBatch();
+});
+
+document.getElementById('btnPause').addEventListener('click', () => {
+  isPaused = true;
+  isRunning = false;
+  showPaused();
+});
+
+// Start processing immediately
+processBatch();
+</script>
+</body></html>
+<?php
 }
 
 function getClientForValidation(): Client {
@@ -171,123 +622,6 @@ function appendRows(Sheets $sh, string $spreadsheetId, string $sheetName, array 
 function progress(Sheets $sh,string $spreadsheetId,string $event,string $detail,string $note,int $minMs){
   $row = [[localNowIso(),$event,$detail,$note]];
   appendRows($sh,$spreadsheetId,SHEET_PROGRESS,$row,$minMs,100);
-}
-
-function flush_out($line="") {
-  echo $line; if (substr($line,-1)!="\n") echo "\n";
-  echo str_repeat(' ', 2048); // coax flush on some hosts
-  @ob_flush(); @flush();
-}
-
-function outputHtmlStart(string $sheetName, string $startDate, ?string $endDate, ?string $folderId, bool $updateOnly, string $spreadsheetUrl) {
-  ?>
-<!doctype html><html><head>
-<meta charset="utf-8">
-<title>Running: <?=htmlspecialchars($sheetName)?></title>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#f8fafc}
-.header{background:#fff;border-radius:12px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
-.header h2{margin:0 0 1rem}
-.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.5rem;font-size:.9rem;color:#666}
-.meta span{background:#f1f5f9;padding:.5rem .75rem;border-radius:6px}
-.progress-box{background:#fff;border-radius:12px;padding:1.5rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}
-.progress-bar{height:24px;background:#e2e8f0;border-radius:12px;overflow:hidden;margin:1rem 0}
-.progress-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#2563eb);transition:width .3s;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:.8rem}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:1rem 0}
-.stat{text-align:center;padding:1rem;background:#f8fafc;border-radius:8px}
-.stat-value{font-size:1.5rem;font-weight:700;color:#1e40af}
-.stat-label{font-size:.75rem;color:#64748b;text-transform:uppercase}
-.log{background:#1e293b;color:#e2e8f0;padding:1rem;border-radius:8px;font-family:ui-monospace,monospace;font-size:.85rem;max-height:400px;overflow-y:auto;margin-top:1rem}
-.log-entry{padding:.25rem 0;border-bottom:1px solid #334155}
-.log-entry:last-child{border:none}
-.log-channel{color:#60a5fa}
-.log-count{color:#4ade80}
-.checkpoint{background:#fef3c7;color:#92400e;padding:1rem;border-radius:8px;margin-top:1rem;text-align:center}
-.done{background:#d1fae5;color:#065f46;padding:1.5rem;border-radius:8px;margin-top:1rem;text-align:center}
-.done a{color:#065f46;font-weight:600}
-</style>
-</head><body>
-<div class="header">
-  <h2>YT Subscription Downloader</h2>
-  <div class="meta">
-    <span><strong>Sheet:</strong> <?=htmlspecialchars($sheetName)?></span>
-    <span><strong>Start:</strong> <?=htmlspecialchars($startDate)?></span>
-    <span><strong>End:</strong> <?=htmlspecialchars($endDate ?: 'Now')?></span>
-    <span><strong>Mode:</strong> <?=$updateOnly ? 'Update' : 'Backfill'?></span>
-  </div>
-  <?php if ($spreadsheetUrl): ?>
-  <p style="margin-top:1rem"><a href="<?=htmlspecialchars($spreadsheetUrl)?>" target="_blank">Open Spreadsheet →</a></p>
-  <?php endif; ?>
-</div>
-<div class="progress-box">
-  <div id="currentChannel">Starting...</div>
-  <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%">0%</div></div>
-  <div class="stats">
-    <div class="stat"><div class="stat-value" id="statChannels">0/0</div><div class="stat-label">Channels</div></div>
-    <div class="stat"><div class="stat-value" id="statVideos">0</div><div class="stat-label">Videos Added</div></div>
-    <div class="stat"><div class="stat-value" id="statTime">0:00</div><div class="stat-label">Elapsed</div></div>
-  </div>
-  <div class="log" id="log"></div>
-</div>
-<script>
-const startTime = Date.now();
-setInterval(() => {
-  const elapsed = Math.floor((Date.now() - startTime) / 1000);
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
-  document.getElementById('statTime').textContent = mins + ':' + String(secs).padStart(2,'0');
-}, 1000);
-
-function updateProgress(channel, channelNum, totalChannels, videosThisChannel, totalVideos) {
-  const pct = Math.round((channelNum / totalChannels) * 100);
-  document.getElementById('currentChannel').innerHTML = '<strong>Processing:</strong> ' + channel;
-  document.getElementById('progressFill').style.width = pct + '%';
-  document.getElementById('progressFill').textContent = pct + '%';
-  document.getElementById('statChannels').textContent = channelNum + '/' + totalChannels;
-  document.getElementById('statVideos').textContent = totalVideos;
-
-  const log = document.getElementById('log');
-  const entry = document.createElement('div');
-  entry.className = 'log-entry';
-  entry.innerHTML = '<span class="log-channel">[' + channelNum + '/' + totalChannels + '] ' + channel + '</span> <span class="log-count">+' + videosThisChannel + ' videos</span>';
-  log.appendChild(entry);
-  log.scrollTop = log.scrollHeight;
-}
-
-function showCheckpoint() {
-  document.getElementById('currentChannel').innerHTML = '<strong>Checkpoint reached</strong>';
-  const box = document.querySelector('.progress-box');
-  box.innerHTML += '<div class="checkpoint"><strong>Time limit reached.</strong> Run again to continue from where you left off.</div>';
-}
-
-function showDone(totalVideos, sheetUrl) {
-  document.getElementById('currentChannel').innerHTML = '<strong>Complete!</strong>';
-  document.getElementById('progressFill').style.width = '100%';
-  document.getElementById('progressFill').textContent = '100%';
-  const box = document.querySelector('.progress-box');
-  box.innerHTML += '<div class="done"><strong>Done!</strong> Added ' + totalVideos + ' videos.<br><a href="' + sheetUrl + '" target="_blank">Open Spreadsheet →</a></div>';
-}
-</script>
-<?php
-  echo str_repeat(' ', 4096); @ob_flush(); @flush();
-}
-
-function outputProgress(int $channelNum, int $totalChannels, string $channelName, int $videosThisChannel, int $totalVideos) {
-  $safe = htmlspecialchars($channelName, ENT_QUOTES);
-  echo "<script>updateProgress('$safe', $channelNum, $totalChannels, $videosThisChannel, $totalVideos);</script>\n";
-  echo str_repeat(' ', 1024); @ob_flush(); @flush();
-}
-
-function outputCheckpoint() {
-  echo "<script>showCheckpoint();</script>\n";
-  echo str_repeat(' ', 1024); @ob_flush(); @flush();
-}
-
-function outputDone(int $totalVideos, string $sheetUrl) {
-  $safeUrl = htmlspecialchars($sheetUrl, ENT_QUOTES);
-  echo "<script>showDone($totalVideos, '$safeUrl');</script>\n";
-  echo "</body></html>";
-  @ob_flush(); @flush();
 }
 
 function localNowIso(): string {
@@ -641,18 +975,16 @@ code{background:#f5f5f5;padding:0 .25rem;border-radius:4px}
   exit;
 }
 
-// Run
-@ini_set('output_buffering','off'); @ini_set('zlib.output_compression', 0);
-while (ob_get_level()>0) ob_end_flush();
-ob_implicit_flush(true);
-
+// ─────────────────────────────────────────────────────────────────────────────
+// POST: Initialize state and redirect to progress page
+// ─────────────────────────────────────────────────────────────────────────────
 $startDate = trim($_POST['start'] ?? '');
 $endDate   = trim($_POST['end'] ?? '');
 $sheetName = trim($_POST['sheetName'] ?? '');
 $folderId  = trim($_POST['folderId'] ?? '');
 $updateOnly= !empty($_POST['updateOnly']);
 
-// Simple validation errors (before HTML starts)
+// Validation
 if (!$startDate) { http_response_code(400); die('<!doctype html><html><body><h2>Error</h2><p>Missing start date</p></body></html>'); }
 if (!$sheetName){ http_response_code(400); die('<!doctype html><html><body><h2>Error</h2><p>Missing spreadsheet name</p></body></html>'); }
 
@@ -680,204 +1012,44 @@ if ($folderId) {
 }
 
 // Open or create spreadsheet (in folder if provided)
-list($spreadsheetId, $folderUsed) = createOrOpenSpreadsheet($sh,$dv,$sheetName, $folderId, $HEADER,$WRITE_MIN_INTERVAL_MS);
-$spreadsheetUrl = "https://docs.google.com/spreadsheets/d/$spreadsheetId";
+list($spreadsheetId, $folderUsed) = createOrOpenSpreadsheet($sh, $dv, $sheetName, $folderId, $HEADER, $WRITE_MIN_INTERVAL_MS);
 
-// Now we can start HTML output
-outputHtmlStart($sheetName, $startDate, $endDate, $folderId, $updateOnly, $spreadsheetUrl);
-
-// Per-sheet state
-$stateKey = 'sheet_'.$spreadsheetId;
+// Create unique state key for this run
+$stateKey = 'run_' . $spreadsheetId . '_' . time();
 $stateAll = loadState();
-$state = isset($stateAll[$stateKey]) ? $stateAll[$stateKey] : [];
-$state['since'] = 'local:' . $startDate;
 
-// Subscriptions
-if (empty($state['subs'])) {
-  $subs = fetchAllSubscriptions($yt,$YT_BASE_DELAY_MS);
-  if (!$subs) { echo "<script>document.getElementById('currentChannel').innerHTML='<strong>Error:</strong> No subscriptions found.';</script>"; exit; }
-  usort($subs,function($a,$b){return strcmp($a['channelId'],$b['channelId']);});
-  $state['subs']=$subs; $state['total']=count($subs); $state['nextIndex']=0;
-  $stateAll[$stateKey]=$state; saveState($stateAll);
-} else { $subs = $state['subs']; }
-$total = $state['total']; $nextIndex = $state['nextIndex'] ?? 0;
-
-// Uploads map
-if (empty($state['uploadsMap'])) {
-  $uploadsMap = buildUploadsMap($yt,array_map(function($s){return $s['channelId'];},$subs),$YT_BASE_DELAY_MS);
-  $state['uploadsMap']=$uploadsMap; $stateAll[$stateKey]=$state; saveState($stateAll);
-} else { $uploadsMap = $state['uploadsMap']; }
-
-// Existing IDs (for dedupe / Update-only)
-$existingIds = getExistingVideoIds($sh,$spreadsheetId,SHEET_DATA);
-
-$startRun = microtime(true);
-$processedTotal = 0;
-
-for ($i = $nextIndex; $i < $total; $i++) {
-  $sub = $subs[$i]; $cid=$sub['channelId']; $ctitle=$sub['channelTitle']?:$cid;
-
-  $uploadsId = isset($uploadsMap[$cid])?$uploadsMap[$cid]:null;
-  if (!$uploadsId) {
-    outputProgress($i+1, $total, $ctitle . ' (skipped)', 0, $processedTotal);
-    $state['nextIndex']=$i+1; $stateAll[$stateKey]=$state; saveState($stateAll); continue;
-  }
-
-  $pageToken=null; $monotonic=true; $pendingVideos=[]; $processedRows=0;
-
-  // First pass: collect video info that passes filters
-  do {
-    try {
-      $resp = callWithBackoff(function() use($yt,$uploadsId,$pageToken){
-        return $yt->playlistItems->listPlaylistItems('snippet,contentDetails',[
-          'playlistId'=>$uploadsId,'maxResults'=>50,'pageToken'=>$pageToken
-        ]);
-      }, $MAX_BACKOFF_ATTEMPTS,$BACKOFF_BASE_SECONDS);
-    } catch (Google\Service\Exception $e) {
-      if ($e->getCode()===404 && strpos($e->getMessage(),'playlistId')!==false) {
-        $newUp = resolveUploadsForChannel($yt,$cid,$YT_BASE_DELAY_MS);
-        if ($newUp && $newUp !== $uploadsId) {
-          $uploadsId=$uploadsMap[$cid]=$newUp;
-          $state['uploadsMap']=$uploadsMap; $stateAll[$stateKey]=$state; saveState($stateAll);
-          $resp = callWithBackoff(function() use($yt,$uploadsId,$pageToken){
-            return $yt->playlistItems->listPlaylistItems('snippet,contentDetails',[
-              'playlistId'=>$uploadsId,'maxResults'=>50,'pageToken'=>$pageToken
-            ]);
-          }, $MAX_BACKOFF_ATTEMPTS,$BACKOFF_BASE_SECONDS);
-        } else {
-          $resp=null; // playlist not found, will skip
-        }
-      } else { throw $e; }
-    }
-    if (!$resp) break;
-
-    $items = $resp->getItems();
-    if (!$items || !count($items)) break;
-
-    usleep($YT_BASE_DELAY_MS*1000);
-
-    $prevTs=null; $oldestTsInPage=null;
-    foreach ($items as $it) {
-      $sn=$it->getSnippet(); $cd=$it->getContentDetails();
-      $videoId = $cd ? $cd->getVideoId() : null;
-
-      $publishedIso = null;
-      if ($cd && $cd->getVideoPublishedAt()) $publishedIso=$cd->getVideoPublishedAt();
-      elseif ($sn && $sn->getPublishedAt()) $publishedIso=$sn->getPublishedAt();
-      if (!$videoId || !$publishedIso) continue;
-
-      $pubTs = strtotime($publishedIso);
-      if ($prevTs!==null && $pubTs>$prevTs) $monotonic=false;
-      $prevTs=$pubTs;
-      if ($oldestTsInPage===null || $pubTs<$oldestTsInPage) $oldestTsInPage=$pubTs;
-
-      // Filter by local window mapped to UTC
-      if ($pubTs < $sinceTsUtc) continue;
-      if ($endTsUtc && $pubTs > $endTsUtc) continue;
-
-      if (!isset($existingIds[$videoId])) {
-        $existingIds[$videoId]=true;
-        $title = ($sn && $sn->getTitle()) ? $sn->getTitle() : 'Open';
-        $channelTitle = ($sn && $sn->getChannelTitle()) ? $sn->getChannelTitle() : '';
-        $pendingVideos[$videoId] = [
-          'channelTitle' => $channelTitle,
-          'title' => $title,
-          'pubTs' => $pubTs,
-          'cid' => $cid
-        ];
-      }
-    }
-
-    $early = $monotonic && $oldestTsInPage!==null && $oldestTsInPage<$sinceTsUtc;
-    $pageToken = $early ? null : $resp->getNextPageToken();
-
-    // Flush pending videos in batches to avoid memory issues
-    if (count($pendingVideos) >= $CHANNEL_FLUSH_CHUNK) {
-      // Fetch video details for this batch
-      $videoDetails = fetchVideoDetails($yt, array_keys($pendingVideos), $YT_BASE_DELAY_MS);
-
-      // Build rows with all columns
-      $channelRows = [];
-      foreach ($pendingVideos as $videoId => $info) {
-        $url = 'https://www.youtube.com/watch?v=' . $videoId;
-        $link = '=HYPERLINK("' . $url . '","' . escapeFormula($info['title']) . '")';
-        $details = $videoDetails[$videoId] ?? ['duration'=>'?','seconds'=>0,'isShort'=>'?','isVertical'=>'?'];
-        $channelRows[] = [
-          $info['channelTitle'],
-          $info['title'],
-          displayLocalFromTs($info['pubTs']),
-          $link,
-          $details['duration'],
-          $details['seconds'],
-          $details['isShort'],
-          $details['isVertical']
-        ];
-      }
-
-      appendRows($sh,$spreadsheetId,SHEET_DATA,$channelRows,$WRITE_MIN_INTERVAL_MS);
-      $processedRows += count($channelRows); $processedTotal += count($channelRows);
-      outputProgress($i+1, $total, $ctitle, $processedRows, $processedTotal);
-      $pendingVideos = [];
-    }
-
-    if ((microtime(true)-$startRun)>$SOFT_TIME_GUARD_SEC) {
-      // Flush any remaining pending videos
-      if (!empty($pendingVideos)) {
-        $videoDetails = fetchVideoDetails($yt, array_keys($pendingVideos), $YT_BASE_DELAY_MS);
-        $channelRows = [];
-        foreach ($pendingVideos as $videoId => $info) {
-          $url = 'https://www.youtube.com/watch?v=' . $videoId;
-          $link = '=HYPERLINK("' . $url . '","' . escapeFormula($info['title']) . '")';
-          $details = $videoDetails[$videoId] ?? ['duration'=>'?','seconds'=>0,'isShort'=>'?','isVertical'=>'?'];
-          $channelRows[] = [
-            $info['channelTitle'],
-            $info['title'],
-            displayLocalFromTs($info['pubTs']),
-            $link,
-            $details['duration'],
-            $details['seconds'],
-            $details['isShort'],
-            $details['isVertical']
-          ];
-        }
-        appendRows($sh,$spreadsheetId,SHEET_DATA,$channelRows,$WRITE_MIN_INTERVAL_MS);
-        $processedRows += count($channelRows); $processedTotal += count($channelRows);
-        outputProgress($i+1, $total, $ctitle, $processedRows, $processedTotal);
-      }
-      progress($sh,$spreadsheetId,'Checkpoint','Time guard','Re-run to resume',$WRITE_MIN_INTERVAL_MS);
-      $state['nextIndex']=$i; $stateAll[$stateKey]=$state; saveState($stateAll);
-      outputCheckpoint();
-      exit;
-    }
-  } while ($pageToken);
-
-  // Flush any remaining pending videos for this channel
-  if (!empty($pendingVideos)) {
-    $videoDetails = fetchVideoDetails($yt, array_keys($pendingVideos), $YT_BASE_DELAY_MS);
-    $channelRows = [];
-    foreach ($pendingVideos as $videoId => $info) {
-      $url = 'https://www.youtube.com/watch?v=' . $videoId;
-      $link = '=HYPERLINK("' . $url . '","' . escapeFormula($info['title']) . '")';
-      $details = $videoDetails[$videoId] ?? ['duration'=>'?','seconds'=>0,'isShort'=>'?','isVertical'=>'?'];
-      $channelRows[] = [
-        $info['channelTitle'],
-        $info['title'],
-        displayLocalFromTs($info['pubTs']),
-        $link,
-        $details['duration'],
-        $details['seconds'],
-        $details['isShort'],
-        $details['isVertical']
-      ];
-    }
-    appendRows($sh,$spreadsheetId,SHEET_DATA,$channelRows,$WRITE_MIN_INTERVAL_MS);
-    $processedRows += count($channelRows); $processedTotal += count($channelRows);
-    outputProgress($i+1, $total, $ctitle, $processedRows, $processedTotal);
-  }
-
-  progress($sh,$spreadsheetId,'Done channel',(string)($i+1),$ctitle.' (+' . $processedRows . ')',$WRITE_MIN_INTERVAL_MS);
-  $state['nextIndex']=$i+1; $stateAll[$stateKey]=$state; saveState($stateAll);
+// Fetch subscriptions
+$subs = fetchAllSubscriptions($yt, $YT_BASE_DELAY_MS);
+if (!$subs) {
+  die('<!doctype html><html><body><h2>Error</h2><p>No subscriptions found. Make sure you have YouTube subscriptions.</p></body></html>');
 }
+usort($subs, function($a, $b) { return strcmp($a['channelId'], $b['channelId']); });
 
-progress($sh,$spreadsheetId,'Complete','All subscriptions processed','',$WRITE_MIN_INTERVAL_MS);
-outputDone($processedTotal, $spreadsheetUrl);
+// Build uploads map
+$uploadsMap = buildUploadsMap($yt, array_map(function($s) { return $s['channelId']; }, $subs), $YT_BASE_DELAY_MS);
+
+// Save state with all info needed for processing
+$state = [
+  'sheetName' => $sheetName,
+  'startDate' => $startDate,
+  'endDate' => $endDate,
+  'updateOnly' => $updateOnly,
+  'spreadsheetId' => $spreadsheetId,
+  'sinceTsUtc' => $sinceTsUtc,
+  'endTsUtc' => $endTsUtc,
+  'subs' => $subs,
+  'total' => count($subs),
+  'nextIndex' => 0,
+  'uploadsMap' => $uploadsMap,
+  'processedTotal' => 0,
+  'createdAt' => time()
+];
+$stateAll[$stateKey] = $state;
+saveState($stateAll);
+
+// Log start
+progress($sh, $spreadsheetId, 'Started', 'Processing ' . count($subs) . ' channels', '', $WRITE_MIN_INTERVAL_MS);
+
+// Redirect to progress page
+header('Location: ?action=progress&stateKey=' . urlencode($stateKey));
+exit;
