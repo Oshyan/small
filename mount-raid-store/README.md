@@ -96,6 +96,34 @@ launchctl list | grep mount-raidstore
 **Mount keeps appearing at `-1` suffix:**
 The script auto-fixes this. Check logs for "fixing to" messages.
 
+**Stale directory blocking mount point:**
+
+If you see this error in the logs:
+```
+ERROR: Stale directory at /Volumes/RAID Store cannot be removed (needs sudo)
+Run: sudo rmdir "/Volumes/RAID Store"
+```
+
+This happens when a previous mount was disconnected but left an empty directory behind. macOS won't mount over an existing directory, so it creates `-1`, `-2`, etc. suffixes instead.
+
+To fix:
+```bash
+# 1. Stop the agent
+launchctl unload ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
+
+# 2. Unmount any existing mounts
+diskutil unmount "/Volumes/RAID Store-1" 2>/dev/null
+diskutil unmount "/Volumes/RAID Store-2" 2>/dev/null
+
+# 3. Remove the stale directory (requires sudo)
+sudo rmdir "/Volumes/RAID Store"
+
+# 4. Restart the agent
+launchctl load ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
+```
+
+The stale directory typically has unusual permissions (`d--x--x--x`) and cannot be listed or removed without sudo.
+
 **Not connecting:**
 1. Check if server is reachable: `nc -z Mac-Server.local 445`
 2. Check Tailscale status: `/Applications/Tailscale.app/Contents/MacOS/Tailscale status`
