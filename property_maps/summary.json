@@ -1,0 +1,15 @@
+{
+  "generated_files": [
+    "00_all_properties_map.png",
+    "01_barstow_outline.png",
+    "02_cleveland_outline.png",
+    "03_cornelia_outline.png",
+    "04_blythe_outline.png"
+  ],
+  "counts": {
+    "barstow": 1,
+    "cleveland": 2,
+    "cornelia": 2,
+    "blythe": 1
+  }
+}
