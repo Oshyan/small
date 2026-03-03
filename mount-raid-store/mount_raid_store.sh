@@ -1,415 +1,402 @@
 #!/bin/zsh
-# Keep /Volumes/RAID Store mounted at one stable path.
-# Prefers LAN (.local / Bonjour), else Tailscale (no MagicDNS).
-# Adds pre-clean so you never get "/Volumes/RAID Store-1".
+# Keep /Volumes/RAID Store mounted at one stable SMB mount point.
+# Home network uses Mac-Server.local (LAN speed); away uses Tailscale.
+# Uses mount_smbfs (non-GUI) to avoid Finder connection dialog pileups.
 
-ENC_SHARE_NAME="RAID%20Store"
+set -u
+
+SHARE_NAME="RAID Store"
+ENC_SHARE_NAME="${SHARE_NAME// /%20}"
 MOUNT_POINT="/Volumes/RAID Store"
 
-# Lock file to prevent concurrent runs
-LOCKFILE="/tmp/mount_raid_store.lock"
-if ! mkdir "$LOCKFILE" 2>/dev/null; then
-  # Check if stale (older than 120s)
-  if [ -d "$LOCKFILE" ] && [ "$(( $(date +%s) - $(stat -f%m "$LOCKFILE") ))" -gt 120 ]; then
-    rmdir "$LOCKFILE" 2>/dev/null
-    mkdir "$LOCKFILE" 2>/dev/null || exit 0
-  else
-    exit 0
-  fi
-fi
-trap 'rmdir "$LOCKFILE" 2>/dev/null' EXIT
+# Home network identity (gateway IP + MAC).
+HOME_GATEWAY_IP="192.168.4.1"
+HOME_GATEWAY_MAC="c4:a8:16:2c:ff:94"
 
-# Rate-limit "not reachable" log messages (once per 10 minutes)
-UNREACHABLE_FLAG="/tmp/mount_raid_store_unreachable"
-
-# Local names (try either)
-HOST_LOCAL1="Mac-Server.local"
-HOST_LOCAL2="Mac Server._smb._tcp.local"
-HOST_LOCAL2_ENC="Mac%20Server._smb._tcp.local"
-
-# Tailscale device + fallback IP
+# Server targets.
+HOST_LOCAL="Mac-Server.local"
+KEYCHAIN_HOST="Mac-Server.local"
 TS_DEVICE_NAME="mac-server"
 LAST_KNOWN_TS_IP="100.76.199.85"
 TSCLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
-# Check if mounted at exact path
-is_mounted() { mount | grep -F "on $MOUNT_POINT " >/dev/null; }
-mounted_at() { mount | grep -F "on $1 " >/dev/null; }
+LOCKDIR="/tmp/mount_raid_store.lock"
+UNREACHABLE_FLAG="/tmp/mount_raid_store_unreachable"
+PASSWORD_FALLBACK_COOLDOWN=1800
+PASSWORD_FALLBACK_BLOCK_FLAG="/tmp/mount_raid_store_password_fallback_block"
 
-# Check if the share is mounted ANYWHERE (including -1, -2, etc.)
-is_share_mounted_anywhere() {
-  mount | grep -E "/$ENC_SHARE_NAME on " >/dev/null
+log() {
+  print -r -- "$(date -Iseconds) $*" >&2
 }
 
-# Get ALL mount points for this share (may be multiple)
-get_all_mount_points() {
-  mount | grep -E "/$ENC_SHARE_NAME on " | sed -E 's|.* on (.*) \(.*|\1|'
+acquire_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    return 0
+  fi
+
+  if [ -d "$LOCKDIR" ]; then
+    local now mtime age
+    now="$(date +%s)"
+    mtime="$(stat -f%m "$LOCKDIR" 2>/dev/null || echo 0)"
+    age=$(( now - mtime ))
+    if (( age > 180 )); then
+      rmdir "$LOCKDIR" 2>/dev/null || true
+      mkdir "$LOCKDIR" 2>/dev/null && return 0
+    fi
+  fi
+  return 1
 }
 
-# Get the first mount point (may be suffixed)
-get_actual_mount_point() {
-  get_all_mount_points | head -1
+release_lock() {
+  rmdir "$LOCKDIR" 2>/dev/null || true
 }
 
-# Unmount ALL instances of this share
-unmount_all_share_mounts() {
-  local mp
-  get_all_mount_points | while read mp; do
-    [ -n "$mp" ] && diskutil unmount "$mp" >/dev/null 2>&1
-  done
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  perl -e 'alarm shift; exec @ARGV' "$seconds" "$@"
 }
 
-current_host() {
-  mount | awk -v MP="$MOUNT_POINT" '$0 ~ "on " MP " " {print $1}' \
-  | sed -E 's|^//[^@]+@([^/]+)/.*$|\1|'
+lower() {
+  print -r -- "$1" | tr '[:upper:]' '[:lower:]'
 }
 
-reach445() { nc -z -G 1 "$1" 445 >/dev/null 2>&1 || nc -z -w 1 "$1" 445 >/dev/null 2>&1; }
+get_default_gateway() {
+  local gw
+  gw="$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF !~ /^utun/ {print $2; exit}')"
+  if [ -n "$gw" ]; then
+    print -r -- "$gw"
+    return
+  fi
 
-# Remove any empty leftover mount dirs (… and …-1, …-2)
-preclean_mount_dirs() {
-  local d
-  for d in "$MOUNT_POINT" "$MOUNT_POINT-1" "$MOUNT_POINT-2" "$MOUNT_POINT-3"; do
-    mounted_at "$d" || rmdir "$d" 2>/dev/null
-  done
+  route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'
+}
+
+is_home_network() {
+  local gw mac
+  gw="$(get_default_gateway)"
+  [ "$gw" = "$HOME_GATEWAY_IP" ] || return 1
+
+  mac="$(arp -n "$HOME_GATEWAY_IP" 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+  [ "$(lower "$mac")" = "$(lower "$HOME_GATEWAY_MAC")" ]
+}
+
+network_mode() {
+  if is_home_network; then
+    print -r -- "home"
+  else
+    print -r -- "away"
+  fi
 }
 
 get_ts_ip() {
-  [ -x "$TSCLI" ] || return
+  [ -x "$TSCLI" ] || return 1
   "$TSCLI" status 2>/dev/null | awk -v n="$TS_DEVICE_NAME" '$2==n {print $1; exit}'
 }
 
-# ── Finder window/tab save & restore ──────────────────────────────
-# Saves full paths of ALL Finder tabs (all windows) open under a given
-# mount point prefix. Uses System Events (requires Accessibility once).
-# Returns newline-separated list: "WINDOW<idx>\tTAB\t<path>" per tab,
-# with WINDOW boundaries so we can regroup tabs into the same windows.
+desired_host_for_mode() {
+  local mode="$1"
+  if [ "$mode" = "home" ]; then
+    print -r -- "$HOST_LOCAL"
+    return
+  fi
 
-SAVED_FINDER_PATHS=""
-
-save_finder_windows() {
-  local prefix="$1"  # e.g. "/Volumes/RAID Store"
-  SAVED_FINDER_PATHS="$(osascript <<APPLESCRIPT 2>/dev/null
-set allPaths to ""
-set matchPrefix to "$prefix"
-
--- Iterate all Finder windows by index
-tell application "Finder"
-  set wCount to count of Finder windows
-end tell
-
-repeat with wIdx from 1 to wCount
-  set windowHasMatch to false
-  set windowPaths to ""
-
-  -- Try to enumerate tabs via System Events
-  set hasTabs to false
-  tell application "System Events"
-    tell process "Finder"
-      try
-        set tg to tab group 1 of window wIdx
-        set tabButtons to every radio button of tg
-        set tabCount to count of tabButtons
-        if tabCount > 1 then set hasTabs to true
-      on error
-        set hasTabs to false
-      end try
-    end tell
-  end tell
-
-  if hasTabs then
-    -- Multi-tab window: find original active tab, click through each
-    set originalTab to 1
-    tell application "System Events"
-      tell process "Finder"
-        set tg to tab group 1 of window wIdx
-        set tabButtons to every radio button of tg
-        repeat with i from 1 to (count of tabButtons)
-          try
-            if value of (item i of tabButtons) is true then
-              set originalTab to i
-            end if
-          end try
-        end repeat
-      end tell
-    end tell
-
-    tell application "System Events"
-      tell process "Finder"
-        set tg to tab group 1 of window wIdx
-        set tabCount to count of (every radio button of tg)
-      end tell
-    end tell
-
-    repeat with i from 1 to tabCount
-      -- Click tab i by window index (no focus steal)
-      tell application "System Events"
-        tell process "Finder"
-          click (radio button i of tab group 1 of window wIdx)
-        end tell
-      end tell
-      delay 0.2
-      tell application "Finder"
-        try
-          set p to POSIX path of (target of (Finder window wIdx) as alias)
-          if p starts with matchPrefix then
-            set windowHasMatch to true
-            set windowPaths to windowPaths & "TAB" & tab & p & linefeed
-          end if
-        end try
-      end tell
-    end repeat
-
-    -- Restore original tab
-    tell application "System Events"
-      tell process "Finder"
-        click (radio button originalTab of tab group 1 of window wIdx)
-      end tell
-    end tell
+  local tsip
+  tsip="$(get_ts_ip)"
+  if [ -n "$tsip" ]; then
+    print -r -- "$tsip"
   else
-    -- Single-tab window
-    tell application "Finder"
-      try
-        set p to POSIX path of (target of (Finder window wIdx) as alias)
-        if p starts with matchPrefix then
-          set windowHasMatch to true
-          set windowPaths to "TAB" & tab & p & linefeed
-        end if
-      end try
-    end tell
-  end if
-
-  if windowHasMatch then
-    set allPaths to allPaths & "WINDOW" & linefeed & windowPaths
-  end if
-end repeat
-
-return allPaths
-APPLESCRIPT
-  )"
-}
-
-restore_finder_windows() {
-  [ -z "$SAVED_FINDER_PATHS" ] && return
-
-  local old_prefix="$1"   # previous mount path (may be suffixed)
-  local new_prefix="$2"   # new mount path (correct)
-  [ -z "$new_prefix" ] && new_prefix="$MOUNT_POINT"
-
-  local current_window_tabs=()
-  local line path adjusted
-
-  while IFS= read -r line; do
-    if [[ "$line" == "WINDOW" ]]; then
-      # Open previous window's tabs (if any)
-      if (( ${#current_window_tabs[@]} > 0 )); then
-        _open_finder_window_with_tabs "${current_window_tabs[@]}"
-      fi
-      current_window_tabs=()
-    elif [[ "$line" == TAB$'\t'* ]]; then
-      path="${line#TAB	}"
-      # Remap from old mount path to new mount path
-      if [ "$old_prefix" != "$new_prefix" ]; then
-        adjusted="${new_prefix}${path#$old_prefix}"
-      else
-        adjusted="$path"
-      fi
-      # Only restore if the path exists on the new mount
-      [ -d "$adjusted" ] && current_window_tabs+=("$adjusted")
-    fi
-  done <<< "$SAVED_FINDER_PATHS"
-
-  # Open last window's tabs
-  if (( ${#current_window_tabs[@]} > 0 )); then
-    _open_finder_window_with_tabs "${current_window_tabs[@]}"
+    print -r -- "$LAST_KNOWN_TS_IP"
   fi
 }
 
-_open_finder_window_with_tabs() {
-  local tabs=("$@")
-  (( ${#tabs[@]} == 0 )) && return
+host_reachable_445() {
+  local host="$1"
+  [ -n "$host" ] || return 1
+  nc -z -G 2 "$host" 445 >/dev/null 2>&1
+}
 
-  # Open first tab as a new Finder window (bypasses "open in tab" setting)
-  osascript -e "tell application \"Finder\" to make new Finder window to POSIX file \"${tabs[1]}\"" 2>/dev/null
-  sleep 0.5
+host_matches_mode() {
+  local host mode hl
+  host="$1"
+  mode="$2"
+  hl="$(lower "$host")"
 
-  # Open remaining tabs into the same window (Cmd+T then navigate)
-  local i
-  for (( i=2; i<=${#tabs[@]}; i++ )); do
-    osascript <<APPLESCRIPT 2>/dev/null
-tell application "Finder"
-  activate
-end tell
-tell application "System Events"
-  keystroke "t" using command down
-  delay 0.3
-end tell
-tell application "Finder"
-  set target of front Finder window to POSIX file "${tabs[$i]}"
-end tell
-APPLESCRIPT
-    sleep 0.3
+  if [ "$mode" = "home" ]; then
+    [[ "$hl" == *.local || "$hl" == 192.168.* ]]
+  else
+    [[ "$hl" == 100.* || "$hl" == *.ts.net ]]
+  fi
+}
+
+list_share_mounts() {
+  mount | awk -v enc="/$ENC_SHARE_NAME on " -v plain="/$SHARE_NAME on " '
+    $0 ~ enc || $0 ~ plain {
+      src=$1
+      mp=$0
+      sub(/^.* on /, "", mp)
+      sub(/ \(.*$/, "", mp)
+      host=src
+      sub(/^\/\//, "", host)
+      sub(/^[^@]*@/, "", host)
+      sub(/\/.*$/, "", host)
+      printf "%s\t%s\n", host, mp
+    }
+  '
+}
+
+mount_count() {
+  list_share_mounts | awk 'END { print NR + 0 }'
+}
+
+canonical_mount_host() {
+  list_share_mounts | awk -F '\t' -v mp="$MOUNT_POINT" '$2 == mp { print $1; exit }'
+}
+
+mounted_at() {
+  mount | grep -F "on $1 (" >/dev/null
+}
+
+unmount_mountpoint() {
+  local mp="$1"
+  [ -n "$mp" ] || return 0
+  diskutil unmount "$mp" >/dev/null 2>&1 || umount "$mp" >/dev/null 2>&1
+}
+
+unmount_all_except() {
+  local keep="$1"
+  local mp
+  while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    [ "$mp" = "$keep" ] && continue
+    unmount_mountpoint "$mp"
+  done < <(list_share_mounts | awk -F '\t' '!seen[$2]++ { print $2 }')
+}
+
+unmount_all_share_mounts() {
+  unmount_all_except ""
+}
+
+unmount_noncanonical_mounts() {
+  local mp
+  while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    unmount_mountpoint "$mp"
+  done < <(list_share_mounts | awk -F '\t' -v target="$MOUNT_POINT" '$2 != target && !seen[$2]++ { print $2 }')
+}
+
+cleanup_stale_mount_dirs() {
+  local d suffix
+  for suffix in "" "-1" "-2" "-3" "-4" "-5"; do
+    d="${MOUNT_POINT}${suffix}"
+    mounted_at "$d" && continue
+    [ -d "$d" ] || continue
+    rmdir "$d" 2>/dev/null || true
   done
 }
 
-# ── Mount helpers ─────────────────────────────────────────────────
-
-mount_url_wait() {
-  local url="$1"
-  # Final guard: if something mounted between our check and now, don't open again
-  is_share_mounted_anywhere && return 0
-  open -g "$url"
-  for i in {1..20}; do
-    is_mounted && return 0
-    sleep 1
-  done
-  # Check if it ended up at a suffixed path and fix immediately
-  if is_share_mounted_anywhere; then
-    local actual="$(get_actual_mount_point)"
-    if [ "$actual" != "$MOUNT_POINT" ]; then
-      echo "$(date -Iseconds) Mounted at $actual instead of $MOUNT_POINT, fixing" >&2
-      # Don't save Finder windows here — caller already saved if needed
-      diskutil unmount "$actual" >/dev/null 2>&1
-      sleep 1
-      preclean_mount_dirs
-      check_stale_mount_dir || return 1
-      open -g "$url"
-      for i in {1..20}; do
-        is_mounted && return 0
-        sleep 1
-      done
-    fi
+ensure_mount_point_dir() {
+  if mounted_at "$MOUNT_POINT"; then
     return 0
   fi
+
+  if [ -d "$MOUNT_POINT" ] && ! rmdir "$MOUNT_POINT" 2>/dev/null; then
+    log "ERROR: stale mount directory at $MOUNT_POINT is not removable."
+    log "Run once manually: sudo rmdir \"$MOUNT_POINT\""
+    return 1
+  fi
+
+  mkdir -p "$MOUNT_POINT" 2>/dev/null || {
+    log "ERROR: failed to create mount point $MOUNT_POINT"
+    return 1
+  }
+}
+
+get_keychain_user() {
+  security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " 2>/dev/null | awk -F '"' '/acct/ { print $4; exit }'
+}
+
+get_keychain_password() {
+  run_with_timeout 6 security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " -w 2>/dev/null
+}
+
+password_fallback_allowed() {
+  if [ ! -f "$PASSWORD_FALLBACK_BLOCK_FLAG" ]; then
+    return 0
+  fi
+
+  local now mtime age
+  now="$(date +%s)"
+  mtime="$(stat -f%m "$PASSWORD_FALLBACK_BLOCK_FLAG" 2>/dev/null || echo 0)"
+  age=$(( now - mtime ))
+
+  if (( age >= PASSWORD_FALLBACK_COOLDOWN )); then
+    rm -f "$PASSWORD_FALLBACK_BLOCK_FLAG"
+    return 0
+  fi
+
   return 1
 }
 
-# Check if stale directory blocking mount point
-check_stale_mount_dir() {
-  if [ -d "$MOUNT_POINT" ] && ! mounted_at "$MOUNT_POINT"; then
-    # Directory exists but nothing mounted there - it's stale
-    if ! rmdir "$MOUNT_POINT" 2>/dev/null; then
-      echo "$(date -Iseconds) ERROR: Stale directory at $MOUNT_POINT cannot be removed (needs sudo)" >&2
-      echo "$(date -Iseconds) Run: sudo rmdir \"$MOUNT_POINT\"" >&2
-      return 1
-    fi
-  fi
-  return 0
+mark_password_fallback_failure() {
+  touch "$PASSWORD_FALLBACK_BLOCK_FLAG"
 }
 
-try_local() {
-  if reach445 "$HOST_LOCAL1"; then
-    mount_url_wait "smb://$HOST_LOCAL1/$ENC_SHARE_NAME" && return 0
+clear_password_fallback_failure() {
+  rm -f "$PASSWORD_FALLBACK_BLOCK_FLAG"
+}
+
+mount_with_temp_nsmb_password() {
+  local host="$1"
+  local user="$2"
+  local password="$3"
+  local tmp_home conf rc
+
+  tmp_home="$(mktemp -d /tmp/mount_raid_store_home.XXXXXX)" || return 1
+  mkdir -p "$tmp_home/Library/Preferences" || {
+    rm -rf "$tmp_home"
+    return 1
+  }
+  conf="$tmp_home/Library/Preferences/nsmb.conf"
+
+  cat > "$conf" <<EOF
+[default]
+username=$user
+password=$password
+soft=yes
+EOF
+  chmod 600 "$conf" 2>/dev/null || true
+
+  HOME="$tmp_home" run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$tmp_home"
+  return $rc
+}
+
+mount_share() {
+  local host="$1"
+  local user password
+
+  user="$(get_keychain_user)"
+  [ -z "$user" ] && user="$USER"
+
+  ensure_mount_point_dir || return 1
+
+  if run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1; then
+    clear_password_fallback_failure
+    return 0
   fi
-  if reach445 "$HOST_LOCAL2"; then
-    mount_url_wait "smb://$HOST_LOCAL2_ENC/$ENC_SHARE_NAME" && return 0
+
+  if ! password_fallback_allowed; then
+    log "Keychain password fallback is in cooldown; skipping retry."
+    return 1
   fi
+
+  password="$(get_keychain_password)"
+  if [ -z "$password" ]; then
+    mark_password_fallback_failure
+    log "ERROR: keychain password lookup failed for $KEYCHAIN_HOST."
+    return 1
+  fi
+
+  if mount_with_temp_nsmb_password "$host" "$user" "$password"; then
+    clear_password_fallback_failure
+    unset password
+    return 0
+  fi
+
+  mark_password_fallback_failure
+  unset password
   return 1
 }
 
-ensure_preferred() {
-  local cur="$(current_host)"
-  if [ -n "$cur" ] && [ "$cur" != "$HOST_LOCAL1" ] && [ "$cur" != "$HOST_LOCAL2_ENC" ]; then
-    if reach445 "$HOST_LOCAL1" || reach445 "$HOST_LOCAL2"; then
-      # Save Finder windows before unmounting
-      save_finder_windows "$MOUNT_POINT"
-      diskutil unmount "$MOUNT_POINT" >/dev/null 2>&1
-      sleep 1
-      preclean_mount_dirs
-      if mount_url_wait "smb://$HOST_LOCAL1/$ENC_SHARE_NAME" || \
-         mount_url_wait "smb://$HOST_LOCAL2_ENC/$ENC_SHARE_NAME"; then
-        restore_finder_windows "$MOUNT_POINT" "$MOUNT_POINT"
-      else
-        # LAN failed — fall back to original Tailscale connection
-        echo "$(date -Iseconds) LAN switch failed, re-mounting via $cur" >&2
-        preclean_mount_dirs
-        if mount_url_wait "smb://$cur/$ENC_SHARE_NAME"; then
-          restore_finder_windows "$MOUNT_POINT" "$MOUNT_POINT"
-        else
-          echo "$(date -Iseconds) ERROR: Failed to re-mount via Tailscale after LAN switch failure" >&2
-        fi
-      fi
-    fi
-  fi
-}
-
-log_unreachable() {
-  # Only log once per outage (flag file tracks state)
+log_unreachable_once() {
+  local mode="$1"
+  local host="$2"
   if [ ! -f "$UNREACHABLE_FLAG" ]; then
-    echo "$(date -Iseconds) Neither local nor Tailscale host reachable on 445." >&2
+    log "Target SMB host unreachable (mode=$mode host=$host)."
     touch "$UNREACHABLE_FLAG"
   fi
 }
 
-clear_unreachable() {
+clear_unreachable_flag() {
   rm -f "$UNREACHABLE_FLAG"
 }
 
 main() {
-  # Check if share is already mounted anywhere
-  if is_share_mounted_anywhere; then
-    clear_unreachable
-    local actual_mp="$(get_actual_mount_point)"
+  local mode desired reachable count canonical keep
 
-    if [ "$actual_mp" = "$MOUNT_POINT" ]; then
-      # Mounted at correct path - check if we should switch to LAN
-      ensure_preferred
-      exit 0
+  mode="$(network_mode)"
+  desired="$(desired_host_for_mode "$mode")"
+  reachable=0
+  host_reachable_445 "$desired" && reachable=1
+
+  count="$(mount_count)"
+  canonical="$(canonical_mount_host)"
+
+  if (( count > 1 )); then
+    log "Detected $count mounts for this share; removing duplicates."
+    if [ -n "$canonical" ]; then
+      unmount_noncanonical_mounts
+    elif [ "$reachable" -eq 0 ]; then
+      keep="$(list_share_mounts | awk -F '\t' 'NR==1 { print $2 }')"
+      [ -n "$keep" ] && unmount_all_except "$keep"
+    fi
+  fi
+
+  count="$(mount_count)"
+  canonical="$(canonical_mount_host)"
+
+  if (( count == 1 )) && [ -n "$canonical" ] && host_matches_mode "$canonical" "$mode"; then
+    clear_unreachable_flag
+    cleanup_stale_mount_dirs
+    return 0
+  fi
+
+  if [ "$reachable" -eq 0 ]; then
+    if (( count > 0 )); then
+      if [ -n "$canonical" ]; then
+        unmount_noncanonical_mounts
+      else
+        keep="$(list_share_mounts | awk -F '\t' 'NR==1 { print $2 }')"
+        [ -n "$keep" ] && unmount_all_except "$keep"
+      fi
+      cleanup_stale_mount_dirs
+      log "Target $desired unreachable; keeping existing mount state."
+      clear_unreachable_flag
+      return 0
     fi
 
-    # Mounted at wrong path (suffixed) - save windows, fix it
-    echo "$(date -Iseconds) Found mount(s) at wrong path, fixing to $MOUNT_POINT" >&2
-    save_finder_windows "$actual_mp"
+    log_unreachable_once "$mode" "$desired"
+    return 1
+  fi
+
+  if (( count > 0 )); then
+    log "Reconciling existing mount(s) before remount."
     unmount_all_share_mounts
-    sleep 2
-    preclean_mount_dirs
-
-    # Check for stale directory before remounting
-    check_stale_mount_dir || exit 1
-
-    # Remount at correct path
-    if try_local; then
-      restore_finder_windows "$actual_mp" "$MOUNT_POINT"
-      echo "$(date -Iseconds) Successfully remounted at $MOUNT_POINT" >&2
-      exit 0
-    fi
-
-    # Try Tailscale if local failed
-    local TSIP="$(get_ts_ip)"; [ -z "$TSIP" ] && TSIP="$LAST_KNOWN_TS_IP"
-    if [ -n "$TSIP" ] && reach445 "$TSIP"; then
-      mount_url_wait "smb://$TSIP/$ENC_SHARE_NAME" && {
-        restore_finder_windows "$actual_mp" "$MOUNT_POINT"
-        echo "$(date -Iseconds) Successfully remounted at $MOUNT_POINT via Tailscale" >&2
-        exit 0
-      }
-    fi
-
-    echo "$(date -Iseconds) Failed to remount after fixing suffix" >&2
-    exit 1
+    sleep 1
   fi
 
-  # Not mounted anywhere - clean up empty dirs and mount fresh
-  preclean_mount_dirs
+  cleanup_stale_mount_dirs
+  ensure_mount_point_dir || return 1
 
-  # Check for stale directory that would cause suffixed mount
-  check_stale_mount_dir || exit 1
-
-  # Prefer LAN
-  if try_local; then
-    clear_unreachable
-    exit 0
+  if mount_share "$desired"; then
+    clear_unreachable_flag
+    unmount_noncanonical_mounts
+    cleanup_stale_mount_dirs
+    log "Mounted //$desired/$SHARE_NAME at $MOUNT_POINT (mode=$mode)."
+    return 0
   fi
 
-  # Else Tailscale (dynamic IP, then fallback)
-  local TSIP="$(get_ts_ip)"; [ -z "$TSIP" ] && TSIP="$LAST_KNOWN_TS_IP"
-  if [ -n "$TSIP" ] && reach445 "$TSIP"; then
-    if mount_url_wait "smb://$TSIP/$ENC_SHARE_NAME"; then
-      clear_unreachable
-      exit 0
-    fi
-  fi
-
-  log_unreachable
-  exit 1
+  log "ERROR: mount failed for host $desired."
+  log_unreachable_once "$mode" "$desired"
+  return 1
 }
+
+if ! acquire_lock; then
+  exit 0
+fi
+trap 'release_lock' EXIT INT TERM
+
 main
+exit $?

@@ -1,137 +1,109 @@
 # mount-raid-store
 
-A macOS LaunchAgent that automatically mounts an SMB share (`RAID Store`) and keeps it connected. Prefers LAN connection (Bonjour/`.local`), falls back to Tailscale.
+A macOS LaunchAgent that keeps one SMB share mounted at one stable path:
+`/Volumes/RAID Store`.
 
-## Features
+It hard-gates by network mode:
+- Home network: `Mac-Server.local` (direct LAN path)
+- Away network: Tailscale IP for the same server
 
-- Auto-mounts at login and reconnects if disconnected
-- Prefers local network, falls back to Tailscale VPN
-- Fixes suffixed mount points (`RAID Store-1`, `-2`) automatically
-- Logs actions for troubleshooting
+## Current approach
+
+- Uses `mount_smbfs` (non-GUI) instead of `open smb://...`
+- Makes only one target-host decision per run (no local + Tailscale chain)
+- Detects and removes duplicate/suffixed mounts (`RAID Store-1`, `-2`, ...)
+- Uses a lock directory to prevent concurrent runs
+- Uses timed credential fallback so keychain glitches do not hang the job
 
 ## Installation
 
-1. Copy the script to your local bin:
+1. Install script:
    ```bash
    cp mount_raid_store.sh ~/.local/bin/
    chmod +x ~/.local/bin/mount_raid_store.sh
    ```
 
-2. Edit the script to match your server/share names:
+2. Adjust config in `mount_raid_store.sh`:
    ```bash
    SHARE_NAME="RAID Store"
-   HOST_LOCAL1="Mac-Server.local"
+   MOUNT_POINT="/Volumes/RAID Store"
+   HOST_LOCAL="Mac-Server.local"
    TS_DEVICE_NAME="mac-server"
    LAST_KNOWN_TS_IP="100.76.199.85"
+   HOME_GATEWAY_IP="192.168.4.1"
+   HOME_GATEWAY_MAC="c4:a8:16:2c:ff:94"
    ```
 
-3. Copy and load the LaunchAgent:
+3. Install LaunchAgent:
    ```bash
    cp com.oshyan.mount-raidstore.plist ~/Library/LaunchAgents/
-   launchctl load ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
+   launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist 2>/dev/null || true
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
    ```
 
-## Configuration
-
-### Script (`mount_raid_store.sh`)
+## Configuration reference
 
 | Variable | Description |
 |----------|-------------|
 | `SHARE_NAME` | SMB share name |
-| `MOUNT_POINT` | Where to mount (default: `/Volumes/RAID Store`) |
-| `HOST_LOCAL1` | Primary Bonjour hostname |
-| `HOST_LOCAL2` | Secondary Bonjour hostname |
-| `TS_DEVICE_NAME` | Tailscale device name |
+| `MOUNT_POINT` | Canonical mount path |
+| `HOST_LOCAL` | Home/LAN hostname |
+| `KEYCHAIN_HOST` | Host used to query keychain SMB credential |
+| `TS_DEVICE_NAME` | Tailscale peer name |
 | `LAST_KNOWN_TS_IP` | Fallback Tailscale IP |
+| `HOME_GATEWAY_IP` | Expected home default gateway IP |
+| `HOME_GATEWAY_MAC` | Expected home gateway MAC |
 
-### LaunchAgent (`com.oshyan.mount-raidstore.plist`)
+LaunchAgent defaults:
+- `RunAtLoad=true`
+- `StartInterval=60`
+- `ThrottleInterval=30`
 
-| Key | Value | Description |
-|-----|-------|-------------|
-| `RunAtLoad` | true | Run when user logs in |
-| `StartInterval` | 60 | Check every 60 seconds |
-| `ThrottleInterval` | 30 | Minimum 30s between runs |
+## Logs
 
-## Logging
+- stdout: `~/Library/Logs/mount_raidstore.out`
+- stderr: `~/Library/Logs/mount_raidstore.err`
 
-Logs are written to:
-- **stdout**: `~/Library/Logs/mount_raidstore.out`
-- **stderr**: `~/Library/Logs/mount_raidstore.err`
-
-Watch logs in real-time:
+Tail:
 ```bash
 tail -f ~/Library/Logs/mount_raidstore.err
 ```
 
-Example log entries:
-```
-2024-01-15T10:30:00-08:00 Found mount at /Volumes/RAID Store-1, fixing to /Volumes/RAID Store
-2024-01-15T10:30:02-08:00 Successfully remounted at /Volumes/RAID Store
-```
-
 ## Management
 
-**Stop the agent:**
-```bash
-launchctl unload ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
-```
-
-**Start the agent:**
-```bash
-launchctl load ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
-```
-
-**Check status:**
-```bash
-launchctl list | grep mount-raidstore
-```
-
-**Run manually:**
-```bash
-~/.local/bin/mount_raid_store.sh
-```
+- Check status:
+  ```bash
+  launchctl print gui/$(id -u)/com.oshyan.mount-raidstore
+  ```
+- Kick a manual run:
+  ```bash
+  launchctl kickstart -k gui/$(id -u)/com.oshyan.mount-raidstore
+  ```
+- Run script directly:
+  ```bash
+  ~/.local/bin/mount_raid_store.sh
+  ```
 
 ## Troubleshooting
 
-**Mount keeps appearing at `-1` suffix:**
-The script auto-fixes this. Check logs for "fixing to" messages.
-
-**Stale directory blocking mount point:**
-
-If you see this error in the logs:
-```
-ERROR: Stale directory at /Volumes/RAID Store cannot be removed (needs sudo)
-Run: sudo rmdir "/Volumes/RAID Store"
-```
-
-This happens when a previous mount was disconnected but left an empty directory behind. macOS won't mount over an existing directory, so it creates `-1`, `-2`, etc. suffixes instead.
-
-To fix:
+Duplicate mounts still present:
 ```bash
-# 1. Stop the agent
-launchctl unload ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
+mount | grep "RAID Store"
+```
 
-# 2. Unmount any existing mounts
-diskutil unmount "/Volumes/RAID Store-1" 2>/dev/null
-diskutil unmount "/Volumes/RAID Store-2" 2>/dev/null
-
-# 3. Remove the stale directory (requires sudo)
+Stale mountpoint directory:
+```bash
 sudo rmdir "/Volumes/RAID Store"
-
-# 4. Restart the agent
-launchctl load ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
 ```
 
-The stale directory typically has unusual permissions (`d--x--x--x`) and cannot be listed or removed without sudo.
-
-**Not connecting:**
-1. Check if server is reachable: `nc -z Mac-Server.local 445`
-2. Check Tailscale status: `/Applications/Tailscale.app/Contents/MacOS/Tailscale status`
-3. Review error log: `cat ~/Library/Logs/mount_raidstore.err`
-
-**Agent not running:**
+Credential/keychain behavior looks odd (double prompts elsewhere):
 ```bash
-launchctl list | grep mount-raidstore
-# If not listed, reload:
-launchctl load ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist
+security find-internet-password -s "Mac-Server.local" -r "smb "
+```
+This script first tries non-interactive `mount_smbfs -N`; if needed it uses a timed keychain password lookup fallback so the agent does not block forever. Failed fallback attempts are cooled down to avoid repeated prompt loops.
+
+Connectivity checks:
+```bash
+nc -z Mac-Server.local 445
+/Applications/Tailscale.app/Contents/MacOS/Tailscale status
 ```
