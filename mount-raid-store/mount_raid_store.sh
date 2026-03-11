@@ -7,6 +7,7 @@ set -u
 
 SHARE_NAME="RAID Store"
 ENC_SHARE_NAME="${SHARE_NAME// /%20}"
+MOUNT_ESC_SHARE_NAME="${SHARE_NAME// /\\\\040}"
 MOUNT_POINT="/Volumes/RAID Store"
 
 # Home network identity (gateway IP + MAC).
@@ -61,6 +62,26 @@ lower() {
   print -r -- "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+url_encode() {
+  local raw="$1"
+  local out="" i ch hex
+
+  for (( i = 1; i <= ${#raw}; i++ )); do
+    ch="${raw[i]}"
+    case "$ch" in
+      [a-zA-Z0-9.~_-])
+        out+="$ch"
+        ;;
+      *)
+        printf -v hex '%02X' "'$ch"
+        out+="%$hex"
+        ;;
+    esac
+  done
+
+  print -r -- "$out"
+}
+
 get_default_gateway() {
   local gw
   gw="$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF !~ /^utun/ {print $2; exit}')"
@@ -113,7 +134,7 @@ desired_host_for_mode() {
 host_reachable_445() {
   local host="$1"
   [ -n "$host" ] || return 1
-  nc -z -G 2 "$host" 445 >/dev/null 2>&1
+  nc -z -G 2 "$host" 445 >/dev/null 2>&1 || nc -z -w 2 "$host" 445 >/dev/null 2>&1
 }
 
 host_matches_mode() {
@@ -129,9 +150,15 @@ host_matches_mode() {
   fi
 }
 
+share_mount_lines() {
+  mount | awk -v enc="/$ENC_SHARE_NAME on " -v plain="/$SHARE_NAME on " -v esc="/$MOUNT_ESC_SHARE_NAME on " '
+    index($0, enc) || index($0, plain) || index($0, esc) { print }
+  '
+}
+
 list_share_mounts() {
-  mount | awk -v enc="/$ENC_SHARE_NAME on " -v plain="/$SHARE_NAME on " '
-    $0 ~ enc || $0 ~ plain {
+  share_mount_lines | awk '
+    {
       src=$1
       mp=$0
       sub(/^.* on /, "", mp)
@@ -187,7 +214,8 @@ unmount_noncanonical_mounts() {
 
 cleanup_stale_mount_dirs() {
   local d suffix
-  for suffix in "" "-1" "-2" "-3" "-4" "-5"; do
+  # Keep the canonical mount point directory; mount_smbfs needs it to persist.
+  for suffix in "-1" "-2" "-3" "-4" "-5"; do
     d="${MOUNT_POINT}${suffix}"
     mounted_at "$d" && continue
     [ -d "$d" ] || continue
@@ -196,18 +224,18 @@ cleanup_stale_mount_dirs() {
 }
 
 ensure_mount_point_dir() {
-  if mounted_at "$MOUNT_POINT"; then
+  if mounted_at "$MOUNT_POINT" || [ -d "$MOUNT_POINT" ]; then
     return 0
   fi
 
-  if [ -d "$MOUNT_POINT" ] && ! rmdir "$MOUNT_POINT" 2>/dev/null; then
-    log "ERROR: stale mount directory at $MOUNT_POINT is not removable."
-    log "Run once manually: sudo rmdir \"$MOUNT_POINT\""
+  if [ -e "$MOUNT_POINT" ]; then
+    log "ERROR: mount point path exists but is not a directory: $MOUNT_POINT"
     return 1
   fi
 
   mkdir -p "$MOUNT_POINT" 2>/dev/null || {
     log "ERROR: failed to create mount point $MOUNT_POINT"
+    log "Run once manually: sudo mkdir -p \"$MOUNT_POINT\" && sudo chown \"$USER\" \"$MOUNT_POINT\""
     return 1
   }
 }
@@ -246,31 +274,16 @@ clear_password_fallback_failure() {
   rm -f "$PASSWORD_FALLBACK_BLOCK_FLAG"
 }
 
-mount_with_temp_nsmb_password() {
+mount_with_url_password() {
   local host="$1"
   local user="$2"
   local password="$3"
-  local tmp_home conf rc
+  local enc_user enc_password
 
-  tmp_home="$(mktemp -d /tmp/mount_raid_store_home.XXXXXX)" || return 1
-  mkdir -p "$tmp_home/Library/Preferences" || {
-    rm -rf "$tmp_home"
-    return 1
-  }
-  conf="$tmp_home/Library/Preferences/nsmb.conf"
+  enc_user="$(url_encode "$user")"
+  enc_password="$(url_encode "$password")"
 
-  cat > "$conf" <<EOF
-[default]
-username=$user
-password=$password
-soft=yes
-EOF
-  chmod 600 "$conf" 2>/dev/null || true
-
-  HOME="$tmp_home" run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
-  rc=$?
-  rm -rf "$tmp_home"
-  return $rc
+  run_with_timeout 20 mount_smbfs -o soft,nopassprompt "//$enc_user:$enc_password@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
 }
 
 mount_share() {
@@ -282,7 +295,7 @@ mount_share() {
 
   ensure_mount_point_dir || return 1
 
-  if run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1; then
+  if run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1; then
     clear_password_fallback_failure
     return 0
   fi
@@ -299,7 +312,7 @@ mount_share() {
     return 1
   fi
 
-  if mount_with_temp_nsmb_password "$host" "$user" "$password"; then
+  if mount_with_url_password "$host" "$user" "$password"; then
     clear_password_fallback_failure
     unset password
     return 0

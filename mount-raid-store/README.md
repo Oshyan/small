@@ -12,6 +12,7 @@ It hard-gates by network mode:
 - Uses `mount_smbfs` (non-GUI) instead of `open smb://...`
 - Makes only one target-host decision per run (no local + Tailscale chain)
 - Detects and removes duplicate/suffixed mounts (`RAID Store-1`, `-2`, ...)
+- Preserves the canonical `/Volumes/RAID Store` directory and only prunes stale suffixed mount dirs
 - Uses a lock directory to prevent concurrent runs
 - Uses timed credential fallback so keychain glitches do not hang the job
 
@@ -34,7 +35,13 @@ It hard-gates by network mode:
    HOME_GATEWAY_MAC="c4:a8:16:2c:ff:94"
    ```
 
-3. Install LaunchAgent:
+3. Create the canonical mount point once:
+   ```bash
+   sudo mkdir -p "/Volumes/RAID Store"
+   sudo chown "$USER" "/Volumes/RAID Store"
+   ```
+
+4. Install LaunchAgent:
    ```bash
    cp com.oshyan.mount-raidstore.plist ~/Library/LaunchAgents/
    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.oshyan.mount-raidstore.plist 2>/dev/null || true
