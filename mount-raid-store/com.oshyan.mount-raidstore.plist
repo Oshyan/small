@@ -9,7 +9,13 @@
   </array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>60</integer>
-  <key>ThrottleInterval</key><integer>30</integer>
+  <key>WatchPaths</key>
+  <array>
+    <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+    <string>/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist</string>
+    <string>/var/run/resolv.conf</string>
+  </array>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>/Users/oshyan/Library/Logs/mount_raidstore.out</string>
   <key>StandardErrorPath</key><string>/Users/oshyan/Library/Logs/mount_raidstore.err</string>
 </dict>

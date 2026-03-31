@@ -1,13 +1,22 @@
 #!/bin/zsh
 # Keep /Volumes/RAID Store mounted at one stable SMB mount point.
-# Home network uses Mac-Server.local (LAN speed); away uses Tailscale.
-# Uses mount_smbfs (non-GUI) to avoid Finder connection dialog pileups.
+# Home network uses Mac-Server.local (LAN); away uses Tailscale IP.
+#
+# Mount method: mount_smbfs (non-GUI, kernel-level).
+#   - No Finder dialogs, no NetAuth hangs
+#   - Credentials from keychain via `security` command
+#   - Mount point directory managed explicitly
+#   - All mount attempts wrapped with timeout to prevent hangs
+#
+# Liveness: stat-checks the mount with a timeout to detect stale mounts.
+#
+# Requires: keychain credentials saved (Cmd+K) for both LAN host and
+# Tailscale IP. nsmb.conf with soft=yes recommended.
 
 set -u
 
 SHARE_NAME="RAID Store"
 ENC_SHARE_NAME="${SHARE_NAME// /%20}"
-MOUNT_ESC_SHARE_NAME="${SHARE_NAME// /\\\\040}"
 MOUNT_POINT="/Volumes/RAID Store"
 
 # Home network identity (gateway IP + MAC).
@@ -21,20 +30,22 @@ TS_DEVICE_NAME="mac-server"
 LAST_KNOWN_TS_IP="100.76.199.85"
 TSCLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
+MOUNT_TIMEOUT=45
 LOCKDIR="/tmp/mount_raid_store.lock"
 UNREACHABLE_FLAG="/tmp/mount_raid_store_unreachable"
-PASSWORD_FALLBACK_COOLDOWN=1800
-PASSWORD_FALLBACK_BLOCK_FLAG="/tmp/mount_raid_store_password_fallback_block"
+
+# --- Logging ---
 
 log() {
   print -r -- "$(date -Iseconds) $*" >&2
 }
 
+# --- Locking ---
+
 acquire_lock() {
   if mkdir "$LOCKDIR" 2>/dev/null; then
     return 0
   fi
-
   if [ -d "$LOCKDIR" ]; then
     local now mtime age
     now="$(date +%s)"
@@ -52,35 +63,57 @@ release_lock() {
   rmdir "$LOCKDIR" 2>/dev/null || true
 }
 
-run_with_timeout() {
-  local seconds="$1"
-  shift
-  perl -e 'alarm shift; exec @ARGV' "$seconds" "$@"
-}
+# --- Helpers ---
 
 lower() {
   print -r -- "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  # Run command in foreground but kill it if it exceeds the timeout.
+  # perl alarm doesn't reliably kill mount_smbfs (kernel mount op),
+  # so we use a background watchdog instead.
+  "$@" &
+  local cmd_pid=$!
+  (
+    sleep "$seconds"
+    kill "$cmd_pid" 2>/dev/null
+    sleep 2
+    kill -9 "$cmd_pid" 2>/dev/null
+  ) &
+  local watchdog_pid=$!
+  wait "$cmd_pid" 2>/dev/null
+  local rc=$?
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
+  return $rc
+}
+
 url_encode() {
   local raw="$1"
   local out="" i ch hex
-
   for (( i = 1; i <= ${#raw}; i++ )); do
     ch="${raw[i]}"
     case "$ch" in
-      [a-zA-Z0-9.~_-])
-        out+="$ch"
-        ;;
-      *)
-        printf -v hex '%02X' "'$ch"
-        out+="%$hex"
-        ;;
+      [a-zA-Z0-9.~_-]) out+="$ch" ;;
+      *) printf -v hex '%02X' "'$ch"; out+="%$hex" ;;
     esac
   done
-
   print -r -- "$out"
 }
+
+get_keychain_user() {
+  security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " 2>/dev/null \
+    | awk -F '"' '/acct/ { print $4; exit }'
+}
+
+get_keychain_password() {
+  run_with_timeout 6 security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " -w 2>/dev/null
+}
+
+# --- Network detection ---
 
 get_default_gateway() {
   local gw
@@ -89,7 +122,6 @@ get_default_gateway() {
     print -r -- "$gw"
     return
   fi
-
   route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'
 }
 
@@ -97,7 +129,6 @@ is_home_network() {
   local gw mac
   gw="$(get_default_gateway)"
   [ "$gw" = "$HOME_GATEWAY_IP" ] || return 1
-
   mac="$(arp -n "$HOME_GATEWAY_IP" 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
   [ "$(lower "$mac")" = "$(lower "$HOME_GATEWAY_MAC")" ]
 }
@@ -121,7 +152,6 @@ desired_host_for_mode() {
     print -r -- "$HOST_LOCAL"
     return
   fi
-
   local tsip
   tsip="$(get_ts_ip)"
   if [ -n "$tsip" ]; then
@@ -131,39 +161,25 @@ desired_host_for_mode() {
   fi
 }
 
-host_reachable_445() {
+host_reachable_smb() {
   local host="$1"
   [ -n "$host" ] || return 1
-  nc -z -G 2 "$host" 445 >/dev/null 2>&1 || nc -z -w 2 "$host" 445 >/dev/null 2>&1
+  nc -z -G 3 "$host" 445 >/dev/null 2>&1 || nc -z -w 3 "$host" 445 >/dev/null 2>&1
 }
 
-host_matches_mode() {
-  local host mode hl
-  host="$1"
-  mode="$2"
-  hl="$(lower "$host")"
+# --- Mount inspection ---
 
-  if [ "$mode" = "home" ]; then
-    [[ "$hl" == *.local || "$hl" == 192.168.* ]]
-  else
-    [[ "$hl" == 100.* || "$hl" == *.ts.net ]]
-  fi
-}
-
-share_mount_lines() {
-  mount | awk -v enc="/$ENC_SHARE_NAME on " -v plain="/$SHARE_NAME on " -v esc="/$MOUNT_ESC_SHARE_NAME on " '
-    index($0, enc) || index($0, plain) || index($0, esc) { print }
-  '
-}
-
+# Find all mount lines for our share (any host, any mount point).
 list_share_mounts() {
-  share_mount_lines | awk '
-    {
-      src=$1
-      mp=$0
+  mount | awk -v share="/$ENC_SHARE_NAME " -v plain="/$SHARE_NAME " '
+    (index($0, share) || index($0, plain)) {
+      src = $1
+      # Extract mount point: everything between " on " and " ("
+      mp = $0
       sub(/^.* on /, "", mp)
       sub(/ \(.*$/, "", mp)
-      host=src
+      # Extract host from source
+      host = src
       sub(/^\/\//, "", host)
       sub(/^[^@]*@/, "", host)
       sub(/\/.*$/, "", host)
@@ -176,158 +192,140 @@ mount_count() {
   list_share_mounts | awk 'END { print NR + 0 }'
 }
 
+# Host of the mount at our canonical mount point, if any.
 canonical_mount_host() {
   list_share_mounts | awk -F '\t' -v mp="$MOUNT_POINT" '$2 == mp { print $1; exit }'
 }
 
 mounted_at() {
-  mount | grep -F "on $1 (" >/dev/null
+  mount | grep -qF "on $1 ("
 }
 
-unmount_mountpoint() {
+# --- Liveness check ---
+# A stale SMB mount appears in mount output but any I/O hangs.
+# Use perl alarm to timeout stat() calls that would hang on stale mounts.
+
+is_mount_alive() {
+  local mp="$1"
+  mounted_at "$mp" || { log "  liveness: not in mount table"; return 1; }
+
+  local rc diag
+  diag="$(perl -e '
+    $SIG{ALRM} = sub { print "TIMEOUT"; exit 2 };
+    alarm 5;
+    if (-d $ARGV[0]) { print "ok"; exit 0 }
+    print "not_accessible";
+    exit 1;
+  ' "$mp" 2>&1)"
+  rc=$?
+  if (( rc != 0 )); then
+    log "  liveness: $diag (rc=$rc)"
+  fi
+  return $rc
+}
+
+# --- Unmount helpers ---
+# diskutil unmount force is the most reliable on macOS.
+# It WILL delete the mount point directory under /Volumes — that's expected;
+# we recreate it before mounting with mount_smbfs.
+
+force_unmount() {
   local mp="$1"
   [ -n "$mp" ] || return 0
-  diskutil unmount "$mp" >/dev/null 2>&1 || umount "$mp" >/dev/null 2>&1
-}
-
-unmount_all_except() {
-  local keep="$1"
-  local mp
-  while IFS= read -r mp; do
-    [ -n "$mp" ] || continue
-    [ "$mp" = "$keep" ] && continue
-    unmount_mountpoint "$mp"
-  done < <(list_share_mounts | awk -F '\t' '!seen[$2]++ { print $2 }')
+  diskutil unmount force "$mp" >/dev/null 2>&1 || umount -f "$mp" >/dev/null 2>&1
 }
 
 unmount_all_share_mounts() {
-  unmount_all_except ""
-}
-
-unmount_noncanonical_mounts() {
-  local mp
-  while IFS= read -r mp; do
+  local host mp
+  while IFS=$'\t' read -r host mp; do
     [ -n "$mp" ] || continue
-    unmount_mountpoint "$mp"
-  done < <(list_share_mounts | awk -F '\t' -v target="$MOUNT_POINT" '$2 != target && !seen[$2]++ { print $2 }')
+    force_unmount "$mp"
+  done < <(list_share_mounts)
 }
 
-cleanup_stale_mount_dirs() {
-  local d suffix
-  # Keep the canonical mount point directory; mount_smbfs needs it to persist.
-  for suffix in "-1" "-2" "-3" "-4" "-5"; do
-    d="${MOUNT_POINT}${suffix}"
+# Remove only non-canonical mounts (suffixed duplicates like "RAID Store-1").
+unmount_noncanonical() {
+  local host mp
+  while IFS=$'\t' read -r host mp; do
+    [ -n "$mp" ] || continue
+    [ "$mp" = "$MOUNT_POINT" ] && continue
+    log "Removing duplicate mount at $mp"
+    force_unmount "$mp"
+  done < <(list_share_mounts)
+}
+
+# Clean up empty suffixed directories left behind.
+cleanup_stale_dirs() {
+  local d
+  for d in "${MOUNT_POINT}"-{1,2,3,4,5}; do
     mounted_at "$d" && continue
     [ -d "$d" ] || continue
     rmdir "$d" 2>/dev/null || true
   done
 }
 
+# --- Mount ---
+
 ensure_mount_point_dir() {
-  if mounted_at "$MOUNT_POINT" || [ -d "$MOUNT_POINT" ]; then
+  if mounted_at "$MOUNT_POINT"; then
     return 0
   fi
-
-  if [ -e "$MOUNT_POINT" ]; then
-    log "ERROR: mount point path exists but is not a directory: $MOUNT_POINT"
-    return 1
+  # Remove stale empty dir if present (from previous force unmount).
+  # Try user-level first, then sudo (Volumes is root-owned).
+  if [ -d "$MOUNT_POINT" ] && ! mounted_at "$MOUNT_POINT"; then
+    rmdir "$MOUNT_POINT" 2>/dev/null || sudo rmdir "$MOUNT_POINT" 2>/dev/null || true
   fi
-
-  mkdir -p "$MOUNT_POINT" 2>/dev/null || {
-    log "ERROR: failed to create mount point $MOUNT_POINT"
-    log "Run once manually: sudo mkdir -p \"$MOUNT_POINT\" && sudo chown \"$USER\" \"$MOUNT_POINT\""
-    return 1
-  }
-}
-
-get_keychain_user() {
-  security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " 2>/dev/null | awk -F '"' '/acct/ { print $4; exit }'
-}
-
-get_keychain_password() {
-  run_with_timeout 6 security find-internet-password -s "$KEYCHAIN_HOST" -r "smb " -w 2>/dev/null
-}
-
-password_fallback_allowed() {
-  if [ ! -f "$PASSWORD_FALLBACK_BLOCK_FLAG" ]; then
-    return 0
+  if [ ! -d "$MOUNT_POINT" ]; then
+    sudo mkdir -p "$MOUNT_POINT" 2>/dev/null && sudo chown "$USER" "$MOUNT_POINT" 2>/dev/null || {
+      log "ERROR: cannot create $MOUNT_POINT"
+      return 1
+    }
   fi
-
-  local now mtime age
-  now="$(date +%s)"
-  mtime="$(stat -f%m "$PASSWORD_FALLBACK_BLOCK_FLAG" 2>/dev/null || echo 0)"
-  age=$(( now - mtime ))
-
-  if (( age >= PASSWORD_FALLBACK_COOLDOWN )); then
-    rm -f "$PASSWORD_FALLBACK_BLOCK_FLAG"
-    return 0
-  fi
-
-  return 1
 }
 
-mark_password_fallback_failure() {
-  touch "$PASSWORD_FALLBACK_BLOCK_FLAG"
-}
-
-clear_password_fallback_failure() {
-  rm -f "$PASSWORD_FALLBACK_BLOCK_FLAG"
-}
-
-mount_with_url_password() {
+do_mount() {
   local host="$1"
-  local user="$2"
-  local password="$3"
-  local enc_user enc_password
-
-  enc_user="$(url_encode "$user")"
-  enc_password="$(url_encode "$password")"
-
-  run_with_timeout 20 mount_smbfs -o soft,nopassprompt "//$enc_user:$enc_password@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
-}
-
-mount_share() {
-  local host="$1"
-  local user password
-
-  user="$(get_keychain_user)"
-  [ -z "$user" ] && user="$USER"
+  local user password enc_user enc_password
 
   ensure_mount_point_dir || return 1
 
-  if run_with_timeout 20 mount_smbfs -N -o soft,nopassprompt "//$user@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1; then
-    clear_password_fallback_failure
-    return 0
-  fi
-
-  if ! password_fallback_allowed; then
-    log "Keychain password fallback is in cooldown; skipping retry."
-    return 1
-  fi
-
+  # Always use explicit credentials from keychain.
+  # mount_smbfs -N (keychain-implicit) is unreliable with multiple SMB
+  # keychain entries — it picks the wrong one or fails authentication.
+  user="$(get_keychain_user)"
+  [ -z "$user" ] && user="$USER"
   password="$(get_keychain_password)"
   if [ -z "$password" ]; then
-    mark_password_fallback_failure
     log "ERROR: keychain password lookup failed for $KEYCHAIN_HOST."
     return 1
   fi
 
-  if mount_with_url_password "$host" "$user" "$password"; then
-    clear_password_fallback_failure
-    unset password
-    return 0
-  fi
+  enc_user="$(url_encode "$user")"
+  enc_password="$(url_encode "$password")"
 
-  mark_password_fallback_failure
-  unset password
-  return 1
+  run_with_timeout "$MOUNT_TIMEOUT" mount_smbfs -o soft "//$enc_user:$enc_password@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
 }
 
-log_unreachable_once() {
-  local mode="$1"
-  local host="$2"
+# --- Unreachable flag (throttle log spam to every 10 minutes) ---
+
+UNREACHABLE_LOG_INTERVAL=600
+
+log_unreachable() {
+  local mode="$1" host="$2"
+  local should_log=0
+
   if [ ! -f "$UNREACHABLE_FLAG" ]; then
-    log "Target SMB host unreachable (mode=$mode host=$host)."
+    should_log=1
+  else
+    local now mtime age
+    now="$(date +%s)"
+    mtime="$(stat -f%m "$UNREACHABLE_FLAG" 2>/dev/null || echo 0)"
+    age=$(( now - mtime ))
+    (( age >= UNREACHABLE_LOG_INTERVAL )) && should_log=1
+  fi
+
+  if (( should_log )); then
+    log "Host unreachable (mode=$mode host=$host). Will retry next cycle."
     touch "$UNREACHABLE_FLAG"
   fi
 }
@@ -336,75 +334,129 @@ clear_unreachable_flag() {
   rm -f "$UNREACHABLE_FLAG"
 }
 
+# --- Main ---
+
 main() {
-  local mode desired reachable count canonical keep
+  local mode desired count canonical
 
   mode="$(network_mode)"
   desired="$(desired_host_for_mode "$mode")"
-  reachable=0
-  host_reachable_445 "$desired" && reachable=1
-
   count="$(mount_count)"
   canonical="$(canonical_mount_host)"
 
+  log "Check: mode=$mode desired=$desired count=$count canonical=${canonical:-none}"
+
+  # --- Clean up duplicates first ---
   if (( count > 1 )); then
-    log "Detected $count mounts for this share; removing duplicates."
-    if [ -n "$canonical" ]; then
-      unmount_noncanonical_mounts
-    elif [ "$reachable" -eq 0 ]; then
-      keep="$(list_share_mounts | awk -F '\t' 'NR==1 { print $2 }')"
-      [ -n "$keep" ] && unmount_all_except "$keep"
-    fi
+    log "Detected $count mounts; removing duplicates."
+    unmount_noncanonical
+    cleanup_stale_dirs
+    count="$(mount_count)"
+    canonical="$(canonical_mount_host)"
   fi
 
-  count="$(mount_count)"
-  canonical="$(canonical_mount_host)"
-
-  if (( count == 1 )) && [ -n "$canonical" ] && host_matches_mode "$canonical" "$mode"; then
-    clear_unreachable_flag
-    cleanup_stale_mount_dirs
-    return 0
-  fi
-
-  if [ "$reachable" -eq 0 ]; then
-    if (( count > 0 )); then
-      if [ -n "$canonical" ]; then
-        unmount_noncanonical_mounts
-      else
-        keep="$(list_share_mounts | awk -F '\t' 'NR==1 { print $2 }')"
-        [ -n "$keep" ] && unmount_all_except "$keep"
+  # --- If we have exactly one mount at the canonical point ---
+  if (( count == 1 )) && [ -n "$canonical" ]; then
+    if is_mount_alive "$MOUNT_POINT"; then
+      # Mount is alive and healthy.
+      # Should we switch to the preferred host?
+      if [ "$canonical" = "$desired" ]; then
+        # Already on the right host. Done.
+        clear_unreachable_flag
+        cleanup_stale_dirs
+        return 0
       fi
-      cleanup_stale_mount_dirs
-      log "Target $desired unreachable; keeping existing mount state."
-      clear_unreachable_flag
-      return 0
+
+      # On a different host. Only switch if preferred is actually reachable.
+      if host_reachable_smb "$desired"; then
+        log "Switching from $canonical to preferred host $desired."
+        force_unmount "$MOUNT_POINT"
+        sleep 1
+        cleanup_stale_dirs
+        # Fall through to mount below.
+      else
+        # Preferred host unreachable but current mount works. Keep it.
+        log "Preferred host $desired unreachable; keeping working mount via $canonical."
+        clear_unreachable_flag
+        cleanup_stale_dirs
+        return 0
+      fi
+    else
+      # Mount is stale/hung.
+      log "Mount via $canonical is stale; forcing unmount."
+      force_unmount "$MOUNT_POINT"
+      sleep 1
+      cleanup_stale_dirs
+      # Fall through to mount below.
     fi
-
-    log_unreachable_once "$mode" "$desired"
-    return 1
-  fi
-
-  if (( count > 0 )); then
-    log "Reconciling existing mount(s) before remount."
+  elif (( count > 0 )); then
+    # Mounts exist but not at canonical point. Clean up.
+    log "Non-canonical mount state; cleaning up."
     unmount_all_share_mounts
     sleep 1
+    cleanup_stale_dirs
   fi
 
-  cleanup_stale_mount_dirs
-  ensure_mount_point_dir || return 1
+  # --- Nothing mounted. Try to mount. ---
 
-  if mount_share "$desired"; then
+  local mounted=0
+
+  # Try preferred host first.
+  if host_reachable_smb "$desired"; then
+    log "Attempting mount to $desired..."
+    if do_mount "$desired"; then
+      sleep 1
+      if mounted_at "$MOUNT_POINT"; then
+        mounted=1
+      else
+        log "ERROR: mount to $desired did not appear at $MOUNT_POINT."
+        unmount_all_share_mounts
+        cleanup_stale_dirs
+      fi
+    else
+      log "ERROR: mount_smbfs to $desired failed."
+    fi
+  else
+    log "Preferred host $desired not reachable on port 445."
+  fi
+
+  if (( mounted )); then
     clear_unreachable_flag
-    unmount_noncanonical_mounts
-    cleanup_stale_mount_dirs
-    log "Mounted //$desired/$SHARE_NAME at $MOUNT_POINT (mode=$mode)."
+    cleanup_stale_dirs
+    log "Mounted via $desired (mode=$mode)."
     return 0
   fi
 
-  log "ERROR: mount failed for host $desired."
-  log_unreachable_once "$mode" "$desired"
+  # Try fallback host.
+  local fallback=""
+  if [ "$mode" = "home" ]; then
+    fallback="$(get_ts_ip)"
+  else
+    fallback="$HOST_LOCAL"
+  fi
+
+  if [ -n "$fallback" ] && [ "$fallback" != "$desired" ]; then
+    if host_reachable_smb "$fallback"; then
+      log "Trying fallback host $fallback..."
+      if do_mount "$fallback" && mounted_at "$MOUNT_POINT"; then
+        clear_unreachable_flag
+        cleanup_stale_dirs
+        log "Mounted via fallback $fallback (mode=$mode)."
+        return 0
+      fi
+      unmount_all_share_mounts
+      cleanup_stale_dirs
+      log "ERROR: fallback mount to $fallback also failed."
+    else
+      log "Fallback host $fallback also not reachable."
+    fi
+  fi
+
+  log_unreachable "$mode" "$desired"
   return 1
 }
+
+# --- Entry point ---
 
 if ! acquire_lock; then
   exit 0
