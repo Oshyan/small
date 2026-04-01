@@ -204,6 +204,9 @@ mounted_at() {
 # --- Liveness check ---
 # A stale SMB mount appears in mount output but any I/O hangs.
 # Use perl alarm to timeout stat() calls that would hang on stale mounts.
+# IMPORTANT: We test BOTH stat (-d) AND actual directory read (opendir/readdir).
+# A mount can pass stat but fail to list contents (broken SMB session after
+# server reboot or sleep/wake), which causes Finder "permission denied" errors.
 
 is_mount_alive() {
   local mp="$1"
@@ -212,10 +215,16 @@ is_mount_alive() {
   local rc diag
   diag="$(perl -e '
     $SIG{ALRM} = sub { print "TIMEOUT"; exit 2 };
-    alarm 5;
-    if (-d $ARGV[0]) { print "ok"; exit 0 }
-    print "not_accessible";
-    exit 1;
+    alarm 8;
+    unless (-d $ARGV[0]) { print "not_a_dir"; exit 1 }
+    # stat passed — now try to actually read directory contents.
+    # A stale mount often passes stat but hangs or errors on readdir.
+    unless (opendir(my $dh, $ARGV[0])) { print "opendir_failed:$!"; exit 1 }
+    my @entries = readdir($dh);
+    closedir($dh);
+    if (@entries < 2) { print "empty_readdir"; exit 1 }
+    print "ok";
+    exit 0;
   ' "$mp" 2>&1)"
   rc=$?
   if (( rc != 0 )); then
@@ -304,6 +313,17 @@ do_mount() {
   enc_password="$(url_encode "$password")"
 
   run_with_timeout "$MOUNT_TIMEOUT" mount_smbfs -o soft "//$enc_user:$enc_password@$host/$ENC_SHARE_NAME" "$MOUNT_POINT" >/dev/null 2>&1
+}
+
+# --- Finder notification ---
+# After a remount, Finder's cached volume state is stale.
+# Poke Finder so it picks up the new mount and doesn't show "permission denied."
+notify_finder() {
+  # Tell Finder to refresh its cached state for this volume.
+  # Only runs if Finder is already active — won't launch it if it isn't.
+  if pgrep -qx Finder; then
+    osascript -e 'tell application "Finder" to update item (POSIX file "/Volumes/RAID Store")' 2>/dev/null || true
+  fi
 }
 
 # --- Unreachable flag (throttle log spam to every 10 minutes) ---
@@ -423,6 +443,7 @@ main() {
   if (( mounted )); then
     clear_unreachable_flag
     cleanup_stale_dirs
+    notify_finder
     log "Mounted via $desired (mode=$mode)."
     return 0
   fi
@@ -441,6 +462,7 @@ main() {
       if do_mount "$fallback" && mounted_at "$MOUNT_POINT"; then
         clear_unreachable_flag
         cleanup_stale_dirs
+        notify_finder
         log "Mounted via fallback $fallback (mode=$mode)."
         return 0
       fi
