@@ -212,23 +212,36 @@ is_mount_alive() {
   local mp="$1"
   mounted_at "$mp" || { log "  liveness: not in mount table"; return 1; }
 
+  # Check 1: stat with timeout — catches fully hung/stale mounts.
   local rc diag
   diag="$(perl -e '
     $SIG{ALRM} = sub { print "TIMEOUT"; exit 2 };
     alarm 8;
     unless (-d $ARGV[0]) { print "not_a_dir"; exit 1 }
-    # stat passed — now try to actually read directory contents.
-    # A stale mount often passes stat but hangs or errors on readdir.
-    unless (opendir(my $dh, $ARGV[0])) { print "opendir_failed:$!"; exit 1 }
-    my @entries = readdir($dh);
-    closedir($dh);
-    if (@entries < 2) { print "empty_readdir"; exit 1 }
     print "ok";
     exit 0;
   ' "$mp" 2>&1)"
   rc=$?
   if (( rc != 0 )); then
-    log "  liveness: $diag (rc=$rc)"
+    log "  liveness: stat: $diag (rc=$rc)"
+    return $rc
+  fi
+
+  # Check 2: df with timeout — verifies the SMB session is actually alive.
+  # This works under launchd without TCC/Full Disk Access (unlike opendir).
+  # A stale mount will cause df to hang (caught by timeout) or return error.
+  diag="$(perl -e '
+    $SIG{ALRM} = sub { print "TIMEOUT"; exit 2 };
+    alarm 8;
+    my $out = `df "${\$ARGV[0]}" 2>&1`;
+    if ($? != 0) { print "df_failed"; exit 1 }
+    # df succeeded — mount and SMB session are alive.
+    print "ok";
+    exit 0;
+  ' "$mp" 2>&1)"
+  rc=$?
+  if (( rc != 0 )); then
+    log "  liveness: df: $diag (rc=$rc)"
   fi
   return $rc
 }
