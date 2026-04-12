@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert video scan CSV to formatted Excel spreadsheet."""
+"""Convert the library CSV to a formatted Excel workbook."""
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["openpyxl"]
@@ -11,56 +11,128 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
-INPUT_CSV = Path("/Users/oshyan/Projects/Coding/small/video-maint/video_library.csv")
-OUTPUT_XLSX = Path("/Users/oshyan/Projects/Coding/small/video-maint/video_library.xlsx")
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_CSV = BASE_DIR / "video_library.csv"
+OUTPUT_XLSX = BASE_DIR / "video_library.xlsx"
 
-wb = Workbook()
-ws = wb.active
-ws.title = "Video Library"
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
+    ".webm", ".m4v", ".ts", ".mpg", ".mpeg",
+}
+HEADERS = [
+    "Filename",
+    "Category",
+    "Extension",
+    "Size Bytes",
+    "Size",
+    "Width",
+    "Height",
+    "Resolution",
+    "Delete",
+    "Full Path",
+]
 
-header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-header_font = Font(color="FFFFFF", bold=True, size=11)
-delete_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
-error_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
 
-with open(INPUT_CSV) as f:
-    reader = csv.reader(f)
-    headers = next(reader)
+def extension_for(filename, path):
+    source = filename or path or ""
+    return Path(source).suffix.lower()
 
-    for col_idx, header in enumerate(headers, 1):
+
+def infer_category(row):
+    category = row.get("Category", "").strip()
+    if category:
+        return category
+    if extension_for(row.get("Filename", ""), row.get("Full Path", "")) in VIDEO_EXTENSIONS:
+        return "Video"
+    if row.get("Width") or row.get("Height") or row.get("Resolution"):
+        return "Video"
+    return "Other"
+
+
+def canonical_row(row):
+    filename = row.get("Filename", "")
+    path = row.get("Full Path", row.get("Path", ""))
+    extension = row.get("Extension", "") or extension_for(filename, path)
+    category = infer_category(row)
+    size_bytes = row.get("Size Bytes", row.get("SizeBytes", ""))
+    return {
+        "Filename": filename,
+        "Category": category,
+        "Extension": extension,
+        "Size Bytes": int(size_bytes) if str(size_bytes).isdigit() else None,
+        "Size": row.get("Size", ""),
+        "Width": int(row["Width"]) if row.get("Width") else None,
+        "Height": int(row["Height"]) if row.get("Height") else None,
+        "Resolution": row.get("Resolution", ""),
+        "Delete": row.get("Delete", ""),
+        "Full Path": path,
+    }
+
+
+def add_sheet(wb, title, rows):
+    ws = wb.create_sheet(title)
+    header_fill = PatternFill(start_color="26352D", end_color="26352D", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+    delete_fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0", fill_type="solid")
+    error_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+
+    for col_idx, header in enumerate(HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
-    for row_idx, row in enumerate(reader, 2):
-        filename, width, height, resolution, delete, path = row
+    for row_idx, row in enumerate(rows, 2):
+        for col_idx, header in enumerate(HEADERS, 1):
+            value = row[header]
+            ws.cell(row=row_idx, column=col_idx, value=value)
 
-        ws.cell(row=row_idx, column=1, value=filename)
-        ws.cell(row=row_idx, column=2, value=int(width) if width else None)
-        ws.cell(row=row_idx, column=3, value=int(height) if height else None)
-        ws.cell(row=row_idx, column=4, value=resolution)
-        ws.cell(row=row_idx, column=5, value=delete)
-        ws.cell(row=row_idx, column=5).alignment = Alignment(horizontal="center")
-        ws.cell(row=row_idx, column=6, value=path)
+        ws.cell(row=row_idx, column=9).alignment = Alignment(horizontal="center")
 
-        if delete == "YES":
-            for col in range(1, 7):
+        if row["Delete"] == "YES":
+            for col in range(1, len(HEADERS) + 1):
                 ws.cell(row=row_idx, column=col).fill = delete_fill
-        elif resolution == "ERROR":
-            for col in range(1, 7):
+        elif row["Resolution"] == "ERROR":
+            for col in range(1, len(HEADERS) + 1):
                 ws.cell(row=row_idx, column=col).fill = error_fill
 
-ws.column_dimensions["A"].width = 65
-ws.column_dimensions["B"].width = 8
-ws.column_dimensions["C"].width = 8
-ws.column_dimensions["D"].width = 14
-ws.column_dimensions["E"].width = 8
-ws.column_dimensions["F"].width = 110
+    widths = {
+        "A": 65,
+        "B": 12,
+        "C": 12,
+        "D": 13,
+        "E": 12,
+        "F": 8,
+        "G": 8,
+        "H": 14,
+        "I": 8,
+        "J": 110,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
 
-ws.freeze_panes = "A2"
-ws.auto_filter.ref = f"A1:F{ws.max_row}"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:J{max(ws.max_row, 1)}"
+    return ws
 
-wb.save(OUTPUT_XLSX)
-print(f"Written: {OUTPUT_XLSX}")
-print(f"Rows: {ws.max_row - 1}")
+
+def main():
+    with open(INPUT_CSV, newline="", encoding="utf-8-sig") as f:
+        rows = [canonical_row(row) for row in csv.DictReader(f)]
+
+    wb = Workbook()
+    del wb[wb.active.title]
+
+    videos = [row for row in rows if row["Category"] == "Video"]
+    others = [row for row in rows if row["Category"] != "Video"]
+    add_sheet(wb, "Videos", videos)
+    add_sheet(wb, "Other Files", others)
+
+    wb.save(OUTPUT_XLSX)
+    print(f"Written: {OUTPUT_XLSX}")
+    print(f"Videos: {len(videos)}")
+    print(f"Other files: {len(others)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Library - Delete Review</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #f6f7f4;
+    --surface: #fbfcf8;
+    --surface-strong: #f0f3eb;
+    --text: #1d2520;
+    --muted: #5f6a62;
+    --line: #d9dfd4;
+    --head: #26352d;
+    --head-hover: #31463b;
+    --accent: #1f7a5b;
+    --accent-hover: #176144;
+    --delete-bg: #fff0ed;
+    --delete-hover: #ffe2dc;
+    --warn-bg: #fff6d7;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 20px;
+  }
+  .app { display: grid; gap: 14px; }
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  h1 { font-size: 1.25rem; line-height: 1.2; font-weight: 700; letter-spacing: 0; }
+  .note { color: var(--muted); font-size: 0.85rem; }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tab-button {
+    appearance: none;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 650;
+    padding: 8px 12px;
+  }
+  .tab-button.active {
+    background: var(--head);
+    color: var(--surface);
+    border-color: var(--head);
+  }
+  .toolbar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .toolbar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .toolbar input[type="text"], .toolbar select {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text);
+    background: #fff;
+    font-size: 0.9rem;
+    min-height: 34px;
+    padding: 6px 10px;
+  }
+  .toolbar input[type="text"] { width: min(440px, 100%); }
+  .toolbar select { max-width: 260px; }
+  .toolbar button {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 650;
+    min-height: 34px;
+    padding: 6px 12px;
+  }
+  .btn-check { background: var(--surface-strong); color: var(--text); }
+  .btn-check:hover { background: #e5ebdf; }
+  .btn-save { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-save:hover { background: var(--accent-hover); }
+  .stats {
+    color: var(--muted);
+    font-size: 0.84rem;
+    line-height: 1.5;
+    margin-left: auto;
+  }
+  .stats span { color: var(--text); font-weight: 750; }
+  .hint { color: var(--muted); font-size: 0.82rem; }
+  .is-hidden { display: none !important; }
+  .table-wrap {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: auto;
+    background: var(--surface);
+  }
+  table { width: 100%; border-collapse: collapse; min-width: 980px; }
+  thead th {
+    position: sticky;
+    top: 0;
+    background: var(--head);
+    color: #f6fbf5;
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 750;
+    padding: 10px 12px;
+    text-align: left;
+    user-select: none;
+    white-space: nowrap;
+    z-index: 1;
+  }
+  thead th:hover { background: var(--head-hover); }
+  thead th.sort-asc::after { content: " ▲"; }
+  thead th.sort-desc::after { content: " ▼"; }
+  tbody td {
+    border-bottom: 1px solid #e8ece3;
+    font-size: 0.82rem;
+    padding: 7px 12px;
+    vertical-align: middle;
+  }
+  tbody tr:hover { background: #eef6f1; }
+  tbody tr.marked-delete { background: var(--delete-bg); }
+  tbody tr.marked-delete:hover { background: var(--delete-hover); }
+  tbody tr.error-row { background: var(--warn-bg); }
+  td.cb-cell { text-align: center; width: 44px; }
+  td.cb-cell input { cursor: pointer; height: 16px; width: 16px; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  td.path {
+    color: var(--muted);
+    font-size: 0.78rem;
+    max-width: 520px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tbody td a { color: #176144; font-weight: 600; text-decoration: none; }
+  tbody td a:hover { text-decoration: underline; }
+  .empty-row td { color: var(--muted); padding: 28px 12px; text-align: center; }
+  @media (max-width: 760px) {
+    body { padding: 12px; }
+    .toolbar { align-items: stretch; }
+    .toolbar label, .toolbar button, .toolbar input[type="text"], .toolbar select { width: 100%; }
+    .stats { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<main class="app">
+  <div class="topbar">
+    <div>
+      <h1>Library Delete Review</h1>
+      <p class="note">Video files and other files are split into separate tabs from the same CSV.</p>
+    </div>
+    <div class="tabs" role="tablist" aria-label="File category">
+      <button class="tab-button active" type="button" data-tab="video" role="tab" aria-selected="true">Videos <span id="tabVideoCount">0</span></button>
+      <button class="tab-button" type="button" data-tab="other" role="tab" aria-selected="false">Other files <span id="tabOtherCount">0</span></button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <input type="text" id="search" placeholder="Filter by filename or path...">
+    <label>
+      Delete state
+      <select id="filterDelete">
+        <option value="all">All</option>
+        <option value="delete">Marked for delete</option>
+        <option value="keep">Keep</option>
+      </select>
+    </label>
+    <label id="resolutionFilterWrap">
+      Resolution
+      <select id="filterRes">
+        <option value="all">All resolutions</option>
+        <option value="error">Errors only</option>
+        <option value="lt720">Width &lt; 1280</option>
+        <option value="720">720p width (1280)</option>
+        <option value="1080">1080p width (1920)</option>
+        <option value="4k">4K+ width (3840+)</option>
+      </select>
+    </label>
+    <label id="extensionFilterWrap" class="is-hidden">
+      Extension
+      <select id="filterExt">
+        <option value="all">All extensions</option>
+      </select>
+    </label>
+    <button class="btn-check" type="button" onclick="checkVisible(true)">Check visible</button>
+    <button class="btn-check" type="button" onclick="checkVisible(false)">Uncheck visible</button>
+    <button class="btn-save" type="button" onclick="saveCSV()">Save delete list</button>
+    <div class="stats">
+      Total: <span id="statTotal">0</span> |
+      Delete: <span id="statDel">0</span> |
+      Keep: <span id="statKeep">0</span> |
+      Shown: <span id="statShown">0</span>
+    </div>
+  </div>
+
+  <p class="hint">Shift-click checkboxes to mark or unmark a visible range.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr id="tableHeadRow"></tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+let DATA = [];
+let activeTab = "video";
+let sortCol = "filename";
+let sortDir = 1;
+let visibleIndices = [];
+let lastClickedIdx = null;
+
+const CSV_RAW = __CSV_RAW__;
+const VIDEO_EXTENSIONS = new Set([".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts", ".mpg", ".mpeg"]);
+const CSV_HEADERS = ["Filename", "Category", "Extension", "Size Bytes", "Size", "Width", "Height", "Resolution", "Delete", "Full Path"];
+const COLUMNS = {
+  video: [
+    { key: "delete", label: "Del", width: "44px" },
+    { key: "filename", label: "Filename" },
+    { key: "sizeBytes", label: "Size", className: "num", width: "95px" },
+    { key: "width", label: "Width", className: "num", width: "78px" },
+    { key: "height", label: "Height", className: "num", width: "78px" },
+    { key: "resolution", label: "Resolution", width: "115px" },
+    { key: "extension", label: "Ext", width: "80px" },
+    { key: "path", label: "Full Path" },
+  ],
+  other: [
+    { key: "delete", label: "Del", width: "44px" },
+    { key: "filename", label: "Filename" },
+    { key: "sizeBytes", label: "Size", className: "num", width: "95px" },
+    { key: "extension", label: "Ext", width: "90px" },
+    { key: "path", label: "Full Path" },
+  ],
+};
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"' && text[i + 1] === '"') { current += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { current += ch; }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(current);
+      current = "";
+    } else if (ch === "\n") {
+      row.push(current);
+      rows.push(row);
+      row = [];
+      current = "";
+    } else if (ch !== "\r") {
+      current += ch;
+    }
+  }
+  if (current || row.length) {
+    row.push(current);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function normalizeHeader(header) {
+  return String(header || "").trim().toLowerCase();
+}
+
+function getField(map, names) {
+  for (const name of names) {
+    const key = normalizeHeader(name);
+    if (Object.prototype.hasOwnProperty.call(map, key)) return map[key];
+  }
+  return "";
+}
+
+function getExtension(filename, path) {
+  const source = filename || path || "";
+  const slash = source.lastIndexOf("/");
+  const base = slash >= 0 ? source.slice(slash + 1) : source;
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0 || dot === base.length - 1) return "";
+  return base.slice(dot).toLowerCase();
+}
+
+function normalizeCategory(value, filename, path, width, height, resolution) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "video" || raw === "videos") return "Video";
+  if (raw === "other" || raw === "other files") return "Other";
+  const ext = getExtension(filename, path);
+  if (VIDEO_EXTENSIONS.has(ext)) return "Video";
+  if (width || height || resolution) return "Video";
+  return "Other";
+}
+
+function parseNumber(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatBytes(sizeBytes) {
+  if (!Number.isFinite(sizeBytes)) return "";
+  let size = sizeBytes;
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  if (unitIndex === 0) return `${Math.round(size)} B`;
+  if (size < 10) return `${size.toFixed(1)} ${units[unitIndex]}`;
+  return `${Math.round(size)} ${units[unitIndex]}`;
+}
+
+async function loadData() {
+  const rows = parseCSV(CSV_RAW);
+  if (!rows.length) {
+    renderAll();
+    return;
+  }
+
+  const headers = rows[0].map(normalizeHeader);
+  DATA = rows.slice(1).filter(row => row.length > 1 || row[0]).map(row => {
+    const map = {};
+    headers.forEach((header, index) => { map[header] = row[index] || ""; });
+
+    const filename = getField(map, ["Filename"]);
+    const path = getField(map, ["Full Path", "Path"]);
+    const width = parseNumber(getField(map, ["Width"]));
+    const height = parseNumber(getField(map, ["Height"]));
+    const resolution = getField(map, ["Resolution"]);
+    const extension = getField(map, ["Extension"]) || getExtension(filename, path);
+    const sizeBytes = parseNumber(getField(map, ["Size Bytes", "SizeBytes"]));
+    const size = getField(map, ["Size"]) || formatBytes(sizeBytes);
+    const category = normalizeCategory(getField(map, ["Category", "File Type", "Kind"]), filename, path, width, height, resolution);
+
+    return {
+      filename,
+      category,
+      extension,
+      sizeBytes,
+      size,
+      width,
+      height,
+      resolution,
+      delete: getField(map, ["Delete"]).trim().toUpperCase() === "YES",
+      path,
+    };
+  });
+
+  updateExtensionFilterOptions();
+  renderAll();
+}
+
+function updateExtensionFilterOptions() {
+  const select = document.getElementById("filterExt");
+  const current = select.value;
+  const counts = new Map();
+  for (const item of DATA) {
+    if (item.category !== "Other") continue;
+    const key = item.extension || "__none__";
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  const options = ['<option value="all">All extensions</option>'];
+  [...counts.entries()].sort((a, b) => displayExtension(a[0]).localeCompare(displayExtension(b[0]))).forEach(([ext, count]) => {
+    options.push(`<option value="${escAttr(ext)}">${escHtml(displayExtension(ext))} (${count})</option>`);
+  });
+  select.innerHTML = options.join("");
+  select.value = counts.has(current) ? current : "all";
+}
+
+function displayExtension(extension) {
+  if (!extension || extension === "__none__") return "(none)";
+  return extension;
+}
+
+function setActiveTab(tab) {
+  activeTab = tab;
+  lastClickedIdx = null;
+  if (!COLUMNS[activeTab].some(col => col.key === sortCol)) {
+    sortCol = "filename";
+    sortDir = 1;
+  }
+  document.querySelectorAll(".tab-button").forEach(button => {
+    const selected = button.dataset.tab === tab;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+  document.getElementById("resolutionFilterWrap").classList.toggle("is-hidden", tab !== "video");
+  document.getElementById("extensionFilterWrap").classList.toggle("is-hidden", tab !== "other");
+  renderAll();
+}
+
+function rowMatchesFilters(item) {
+  const category = activeTab === "video" ? "Video" : "Other";
+  if (item.category !== category) return false;
+
+  const query = document.getElementById("search").value.trim().toLowerCase();
+  if (query) {
+    const haystack = `${item.filename} ${item.path}`.toLowerCase();
+    if (!haystack.includes(query)) return false;
+  }
+
+  const deleteFilter = document.getElementById("filterDelete").value;
+  if (deleteFilter === "delete" && !item.delete) return false;
+  if (deleteFilter === "keep" && item.delete) return false;
+
+  if (activeTab === "video") {
+    const res = document.getElementById("filterRes").value;
+    if (res === "error" && item.resolution !== "ERROR") return false;
+    if (res === "lt720" && (item.width === null || item.width >= 1280)) return false;
+    if (res === "720" && item.width !== 1280) return false;
+    if (res === "1080" && item.width !== 1920) return false;
+    if (res === "4k" && (item.width === null || item.width < 3840)) return false;
+  } else {
+    const ext = document.getElementById("filterExt").value;
+    const itemExt = item.extension || "__none__";
+    if (ext !== "all" && itemExt !== ext) return false;
+  }
+
+  return true;
+}
+
+function getSortValue(item, col) {
+  if (col === "delete") return item.delete ? 1 : 0;
+  if (col === "sizeBytes") return item.sizeBytes;
+  return item[col];
+}
+
+function getFilteredIndices() {
+  const indices = [];
+  for (let i = 0; i < DATA.length; i++) {
+    if (rowMatchesFilters(DATA[i])) indices.push(i);
+  }
+
+  indices.sort((a, b) => {
+    let va = getSortValue(DATA[a], sortCol);
+    let vb = getSortValue(DATA[b], sortCol);
+    const aEmpty = va === null || va === undefined || va === "";
+    const bEmpty = vb === null || vb === undefined || vb === "";
+    if (aEmpty && bEmpty) return DATA[a].filename.localeCompare(DATA[b].filename) * sortDir;
+    if (aEmpty) return 1;
+    if (bEmpty) return -1;
+    if (typeof va === "string") va = va.toLowerCase();
+    if (typeof vb === "string") vb = vb.toLowerCase();
+    if (va < vb) return -1 * sortDir;
+    if (va > vb) return 1 * sortDir;
+    return DATA[a].filename.localeCompare(DATA[b].filename);
+  });
+
+  return indices;
+}
+
+function renderAll() {
+  renderHeader();
+  renderTable();
+  updateStats();
+}
+
+function renderHeader() {
+  const row = document.getElementById("tableHeadRow");
+  row.innerHTML = COLUMNS[activeTab].map(col => {
+    const sortClass = sortCol === col.key ? (sortDir === 1 ? "sort-asc" : "sort-desc") : "";
+    const width = col.width ? ` style="width:${col.width}"` : "";
+    return `<th data-col="${escAttr(col.key)}" class="${sortClass}"${width}>${escHtml(col.label)}</th>`;
+  }).join("");
+
+  row.querySelectorAll("th").forEach(th => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.col;
+      if (sortCol === col) sortDir *= -1;
+      else { sortCol = col; sortDir = 1; }
+      renderAll();
+    });
+  });
+}
+
+function getRowClass(item) {
+  if (item.delete) return "marked-delete";
+  if (item.resolution === "ERROR") return "error-row";
+  return "";
+}
+
+function renderCell(item, idx, col) {
+  if (col.key === "delete") {
+    return `<td class="cb-cell"><input type="checkbox" data-idx="${idx}" aria-label="Mark ${escAttr(item.filename)} for deletion" ${item.delete ? "checked" : ""}></td>`;
+  }
+  if (col.key === "filename") {
+    return `<td><a href="file://${encodeURI(item.path)}" target="_blank">${escHtml(item.filename)}</a></td>`;
+  }
+  if (col.key === "sizeBytes") {
+    return `<td class="num">${escHtml(item.size || formatBytes(item.sizeBytes) || "-")}</td>`;
+  }
+  if (col.key === "width" || col.key === "height") {
+    return `<td class="num">${item[col.key] ?? "-"}</td>`;
+  }
+  if (col.key === "extension") {
+    return `<td>${escHtml(displayExtension(item.extension))}</td>`;
+  }
+  if (col.key === "path") {
+    return `<td class="path" title="${escAttr(item.path)}">${escHtml(item.path)}</td>`;
+  }
+  return `<td>${escHtml(item[col.key] || "-")}</td>`;
+}
+
+function renderTable() {
+  const tbody = document.getElementById("tbody");
+  visibleIndices = getFilteredIndices();
+  const columns = COLUMNS[activeTab];
+
+  if (!visibleIndices.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="${columns.length}">No files match the current filters.</td></tr>`;
+    document.getElementById("statShown").textContent = "0";
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const idx of visibleIndices) {
+    const item = DATA[idx];
+    const tr = document.createElement("tr");
+    tr.className = getRowClass(item);
+    tr.innerHTML = columns.map(col => renderCell(item, idx, col)).join("");
+    frag.appendChild(tr);
+  }
+
+  tbody.innerHTML = "";
+  tbody.appendChild(frag);
+  document.getElementById("statShown").textContent = visibleIndices.length;
+
+  tbody.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.addEventListener("click", event => {
+      const idx = Number.parseInt(cb.dataset.idx, 10);
+      applyCheckboxChange(idx, cb.checked, event.shiftKey);
+    });
+  });
+}
+
+function applyCheckboxChange(idx, checked, rangeRequested) {
+  if (rangeRequested && lastClickedIdx !== null) {
+    const start = visibleIndices.indexOf(lastClickedIdx);
+    const end = visibleIndices.indexOf(idx);
+    if (start !== -1 && end !== -1) {
+      const [from, to] = start < end ? [start, end] : [end, start];
+      for (let pos = from; pos <= to; pos++) DATA[visibleIndices[pos]].delete = checked;
+      lastClickedIdx = idx;
+      renderTable();
+      updateStats();
+      return;
+    }
+  }
+
+  DATA[idx].delete = checked;
+  lastClickedIdx = idx;
+  const row = document.querySelector(`#tbody input[data-idx="${idx}"]`)?.closest("tr");
+  if (row) row.className = getRowClass(DATA[idx]);
+  updateStats();
+}
+
+function escHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = String(value ?? "");
+  return div.innerHTML;
+}
+
+function escAttr(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function updateStats() {
+  const total = DATA.length;
+  const del = DATA.filter(item => item.delete).length;
+  const videos = DATA.filter(item => item.category === "Video").length;
+  const others = DATA.filter(item => item.category === "Other").length;
+  document.getElementById("statTotal").textContent = total;
+  document.getElementById("statDel").textContent = del;
+  document.getElementById("statKeep").textContent = total - del;
+  document.getElementById("tabVideoCount").textContent = videos;
+  document.getElementById("tabOtherCount").textContent = others;
+}
+
+function checkVisible(checked) {
+  for (const idx of visibleIndices) DATA[idx].delete = checked;
+  renderTable();
+  updateStats();
+}
+
+function csvEscape(value) {
+  return `"${String(value ?? "").replace(/"/g, '""')}"`;
+}
+
+function saveCSV() {
+  let csv = `${CSV_HEADERS.join(",")}\n`;
+  for (const item of DATA) {
+    const row = [
+      item.filename,
+      item.category,
+      item.extension,
+      item.sizeBytes ?? "",
+      item.size || formatBytes(item.sizeBytes),
+      item.width ?? "",
+      item.height ?? "",
+      item.resolution,
+      item.delete ? "YES" : "",
+      item.path,
+    ];
+    csv += `${row.map(csvEscape).join(",")}\n`;
+  }
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "video_library_reviewed.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+document.querySelectorAll(".tab-button").forEach(button => {
+  button.addEventListener("click", () => setActiveTab(button.dataset.tab));
+});
+document.getElementById("search").addEventListener("input", renderAll);
+document.getElementById("filterDelete").addEventListener("change", renderAll);
+document.getElementById("filterRes").addEventListener("change", renderAll);
+document.getElementById("filterExt").addEventListener("change", renderAll);
+
+loadData();
+</script>
+</body>
+</html>

@@ -1,26 +1,39 @@
 # video-maint
 
-Tools for auditing and cleaning up a local video library on RAID storage. Scans all video files for resolution, outputs an interactive review interface, and handles bulk deletion of low-quality files.
+Tools for auditing and cleaning up a local media library on RAID storage. The scanner records video files and non-video files in one CSV, and the static HTML UI splits them into separate review tabs.
 
 **Repo:** https://github.com/Oshyan/small/tree/main/video-maint
 
 ## How it works
 
-1. **Scan** — `scan_videos_remote.py` runs on Mac-Server via SSH, uses `ffprobe` to extract resolution (width x height) from every video file under `/Volumes/RAID Store/Downloads/`, outputs CSV
-2. **Review** — `video_library.html` presents all 3,711 files with checkboxes, sortable columns, and filters. Files with width < 1920 are pre-checked for deletion
-3. **Delete** — After review, save the updated CSV and use it to execute bulk deletion, producing a log of removed files
+1. **Scan** - `scan_videos_remote.py` runs on Mac-Server via SSH, walks every file under `/Volumes/RAID Store/Downloads/`, records non-video files by extension, and outputs CSV. Existing video dimensions are reused by `Full Path`; only new videos or old `ERROR` rows are probed with `ffprobe`.
+2. **Review** - `video_library.html` presents separate tabs for videos and other files. The tabs are mutually exclusive based on the `Category` column.
+3. **Delete decisions** - both tabs use the same `Delete` column. Existing decisions are preserved by `Full Path` during rescans.
+4. **Refresh** - `rescan_remote.sh` backs up the local CSV, uploads it to Mac-Server, rescans the remote tree, downloads the refreshed CSV, and regenerates HTML/XLSX.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `scan_videos_remote.py` | Resolution scanner (runs on Mac-Server, uses `/tmp/ffprobe`) |
-| `csv_to_xlsx.py` | Converts scan CSV to formatted Excel (optional) |
-| `embed_csv.py` | Embeds CSV data into the HTML for offline use |
-| `video_library.html` | Interactive review UI with checkboxes, sorting, filtering |
-| `video_library.csv` | Raw scan results |
+| `scan_videos_remote.py` | Remote scanner for all files; video resolution plus non-video extension/size |
+| `rescan_remote.sh` | Local helper that backs up, rescans, downloads, and rebuilds outputs |
+| `csv_to_xlsx.py` | Converts scan CSV to formatted Excel sheets for videos and other files |
+| `embed_csv.py` | Embeds CSV data into the HTML template for offline use |
+| `video_library.template.html` | Source template for the review UI |
+| `video_library.html` | Generated interactive review UI with embedded CSV |
+| `video_library.csv` | Raw scan results and delete decisions |
 | `video_library.xlsx` | Excel version of scan results |
-| `scan_videos.py` | Original local scan script (unused, superseded by remote version) |
+| `scan_videos.py` | Original local scan script, retained for reference |
+
+## CSV Schema
+
+The combined CSV uses these columns:
+
+```text
+Filename,Category,Extension,Size Bytes,Size,Width,Height,Resolution,Delete,Full Path
+```
+
+`Category` is `Video` or `Other`. `Width`, `Height`, and `Resolution` are populated for videos. `Extension`, `Size Bytes`, and `Size` are populated for all files where the filesystem exposes size.
 
 ## Setup
 
@@ -33,21 +46,37 @@ cd /tmp && curl -L -o ffprobe.zip "https://evermeet.cx/ffmpeg/getrelease/ffprobe
 
 ## Usage
 
-Run the scan remotely:
+Run a full remote rescan and preserve existing delete decisions:
 
 ```sh
-scp scan_videos_remote.py oshyan@Mac-Server.local:/tmp/scan_videos.py
-ssh oshyan@Mac-Server.local "python3 /tmp/scan_videos.py"
-scp oshyan@Mac-Server.local:/tmp/video_library.csv .
+./rescan_remote.sh
 ```
 
-Re-embed CSV into HTML (if CSV changes):
+The helper writes a local backup before modifying `video_library.csv`:
+
+```text
+backups/video_library.csv.YYYYMMDDTHHMMSS-0700.bak
+```
+
+You can override the remote host:
+
+```sh
+REMOTE=oshyan@Mac-Server.local ./rescan_remote.sh
+```
+
+Open `video_library.html` in a browser to review. Click "Save delete list" when done. Shift-click checkboxes to mark or unmark a visible range.
+
+Re-embed CSV into HTML after manual CSV edits:
 
 ```sh
 uv run embed_csv.py
 ```
 
-Open `video_library.html` in a browser to review. Click "Save delete list" when done.
+Regenerate the Excel workbook:
+
+```sh
+uv run csv_to_xlsx.py
+```
 
 ## TODO
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed CSV data into the HTML file as a JS variable."""
+"""Embed CSV data into the static HTML review UI."""
 # /// script
 # requires-python = ">=3.12"
 # ///
@@ -7,24 +7,28 @@
 import json
 from pathlib import Path
 
-csv_path = Path("/Users/oshyan/Projects/Coding/small/video-maint/video_library.csv")
-html_path = Path("/Users/oshyan/Projects/Coding/small/video-maint/video_library.html")
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "video_library.csv"
+TEMPLATE_PATH = BASE_DIR / "video_library.template.html"
+HTML_PATH = BASE_DIR / "video_library.html"
+PLACEHOLDER = "const CSV_RAW = __CSV_RAW__;"
 
-csv_text = csv_path.read_text()
-html_text = html_path.read_text()
 
-# Replace the fetch-based loadData with embedded data
-old_load = """async function loadData() {
-  const resp = await fetch("video_library.csv");
-  const text = await resp.text();
-  const lines = text.split("\\n");"""
+def main():
+    csv_text = CSV_PATH.read_text(encoding="utf-8")
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-new_load = f"""const CSV_RAW = {json.dumps(csv_text)};
+    if PLACEHOLDER not in template:
+        raise SystemExit("Template is missing CSV placeholder: {}".format(PLACEHOLDER))
 
-async function loadData() {{
-  const text = CSV_RAW;
-  const lines = text.split("\\n");"""
+    html_text = template.replace(
+        PLACEHOLDER,
+        "const CSV_RAW = {};".format(json.dumps(csv_text)),
+    )
+    HTML_PATH.write_text(html_text, encoding="utf-8")
+    print("Embedded {} into {}".format(CSV_PATH.name, HTML_PATH.name))
+    print("HTML size: {:,} bytes".format(len(html_text)))
 
-html_text = html_text.replace(old_load, new_load)
-html_path.write_text(html_text)
-print(f"Done. HTML size: {len(html_text):,} bytes")
+
+if __name__ == "__main__":
+    main()
