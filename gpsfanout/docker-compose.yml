@@ -1,0 +1,21 @@
+services:
+  gpsfanout:
+    build: .
+    container_name: gpsfanout
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${FANOUT_HOST_BIND:-127.0.0.1}:${FANOUT_HOST_PORT:-8765}:8080"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
