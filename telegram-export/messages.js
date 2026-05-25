@@ -236,7 +236,9 @@ async function fetchReactionDetail(client, peer, msgId) {
   const PAGE_LIMIT = 100;
 
   while (true) {
-    const params = { peer, msgId, limit: PAGE_LIMIT };
+    // TL schema field is `id`, not `msgId` — gramjs uses TL field names verbatim.
+    // Passing the wrong name causes Telegram to see id=0 and return MSG_ID_INVALID.
+    const params = { peer, id: msgId, limit: PAGE_LIMIT };
     if (offset) params.offset = offset;
     const result = await client.invoke(new Api.messages.GetMessageReactionsList(params));
     const items = result.reactions || [];
