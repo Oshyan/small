@@ -278,19 +278,40 @@ async function enrichMessagesWithReactions(client, peer, messages) {
   });
   if (toEnrich.length === 0) return 0;
 
+  // Resolve the entity to a proper InputPeer once. Api.messages.GetMessageReactionsList
+  // expects an InputPeer; raw Channel entities don't auto-convert for this parameter.
+  let inputPeer;
+  try {
+    inputPeer = await client.getInputEntity(peer);
+  } catch (e) {
+    console.log(`  warn: could not resolve input peer for reaction enrichment: ${e.message}`);
+    return 0;
+  }
+
   process.stdout.write(`  enriching reactions for ${toEnrich.length} messages`);
   let processed = 0;
+  let firstErrorLogged = false;
+  let errorCount = 0;
   for (const m of toEnrich) {
     try {
-      m._reactionDetail = await fetchReactionDetail(client, peer, m.id);
+      m._reactionDetail = await fetchReactionDetail(client, inputPeer, m.id);
     } catch (e) {
       m._reactionDetail = { detail: [], anonymousCount: 0, error: e.message };
+      errorCount++;
+      if (!firstErrorLogged) {
+        process.stdout.write(`\n  warn: reaction fetch failed for msg ${m.id}: ${e.message}\n  (suppressing further per-message errors; will summarize at end)`);
+        firstErrorLogged = true;
+      }
     }
     processed++;
     if (processed % 50 === 0) process.stdout.write(` ${processed}...`);
     await sleep(50);
   }
-  process.stdout.write(` ${processed} done\n`);
+  if (errorCount > 0) {
+    process.stdout.write(` ${processed} done (${errorCount} errors)\n`);
+  } else {
+    process.stdout.write(` ${processed} done\n`);
+  }
   return processed;
 }
 
