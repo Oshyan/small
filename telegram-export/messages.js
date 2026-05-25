@@ -223,8 +223,158 @@ function jsonifyMessages(messages) {
       custom_emoji_id: r.reaction?.documentId?.toString() || null,
       count: r.count,
     })) : null,
+    reactions_detail: m._reactionDetail?.detail || [],
+    reactions_anonymous_count: m._reactionDetail?.anonymousCount || 0,
     pinned: !!m.pinned,
   }));
+}
+
+async function fetchReactionDetail(client, peer, msgId) {
+  const detail = [];
+  let anonymousCount = 0;
+  let offset = "";
+  const PAGE_LIMIT = 100;
+
+  while (true) {
+    const params = { peer, msgId, limit: PAGE_LIMIT };
+    if (offset) params.offset = offset;
+    const result = await client.invoke(new Api.messages.GetMessageReactionsList(params));
+    const items = result.reactions || [];
+
+    for (const r of items) {
+      const peerId = r.peerId;
+      const senderId = peerId?.userId?.toString()
+        || peerId?.channelId?.toString()
+        || null;
+      const emoji = r.reaction?.emoticon || null;
+      const customEmojiId = r.reaction?.documentId?.toString() || null;
+      const date = r.date ? localIso(new Date(r.date * 1000)) : null;
+
+      if (senderId === null) {
+        anonymousCount++;
+        continue;
+      }
+
+      detail.push({
+        sender_id: senderId,
+        emoji,
+        custom_emoji_id: customEmojiId,
+        date,
+      });
+    }
+
+    if (!result.nextOffset || items.length < PAGE_LIMIT) break;
+    offset = result.nextOffset;
+  }
+
+  return { detail, anonymousCount };
+}
+
+async function enrichMessagesWithReactions(client, peer, messages) {
+  const toEnrich = messages.filter(m => {
+    if (!m.reactions) return false;
+    const results = m.reactions.results || [];
+    return results.some(r => (r.count || 0) > 0);
+  });
+  if (toEnrich.length === 0) return 0;
+
+  process.stdout.write(`  enriching reactions for ${toEnrich.length} messages`);
+  let processed = 0;
+  for (const m of toEnrich) {
+    try {
+      m._reactionDetail = await fetchReactionDetail(client, peer, m.id);
+    } catch (e) {
+      m._reactionDetail = { detail: [], anonymousCount: 0, error: e.message };
+    }
+    processed++;
+    if (processed % 50 === 0) process.stdout.write(` ${processed}...`);
+    await sleep(50);
+  }
+  process.stdout.write(` ${processed} done\n`);
+  return processed;
+}
+
+async function collectAndFetchSenders(client, messages, chatDir) {
+  const senderMap = new Map();
+  for (const m of messages) {
+    const s = m.sender;
+    if (!s) continue;
+    if (s.className !== "User") continue;
+    const id = s.id?.toString();
+    if (!id || senderMap.has(id)) continue;
+    senderMap.set(id, s);
+  }
+  if (senderMap.size === 0) return { processed: 0, downloaded: 0 };
+
+  const avatarsDir = path.join(chatDir, "avatars");
+  await fs.mkdir(avatarsDir, { recursive: true });
+
+  process.stdout.write(`  fetching avatars for ${senderMap.size} senders`);
+  const sendersOut = {};
+  let processed = 0;
+  let downloaded = 0;
+
+  for (const [id, user] of senderMap) {
+    const firstName = user.firstName || null;
+    const lastName = user.lastName || null;
+    const username = user.username || null;
+    const displayName =
+      [firstName, lastName].filter(Boolean).join(" ").trim()
+      || (username ? `@${username}` : `User#${id}`);
+
+    const avatarAbsPath = path.join(avatarsDir, `${id}.jpg`);
+    const avatarRelPath = `avatars/${id}.jpg`;
+    let avatarPathOut = null;
+    let avatarBytesSize = null;
+
+    let exists = false;
+    try { await fs.access(avatarAbsPath); exists = true; } catch {}
+
+    if (exists) {
+      try {
+        const stat = await fs.stat(avatarAbsPath);
+        avatarPathOut = avatarRelPath;
+        avatarBytesSize = stat.size;
+      } catch {}
+    } else if (user.photo) {
+      try {
+        const buf = await client.downloadProfilePhoto(user, { isBig: false });
+        if (buf && buf.length > 0) {
+          await fs.writeFile(avatarAbsPath, buf);
+          avatarPathOut = avatarRelPath;
+          avatarBytesSize = buf.length;
+          downloaded++;
+        }
+      } catch {
+        // user may have privacy restrictions or be deleted; leave avatar null
+      }
+    }
+
+    sendersOut[id] = {
+      sender_id: id,
+      username,
+      display_name: displayName,
+      first_name: firstName,
+      last_name: lastName,
+      phone: user.phone || null,
+      avatar_path: avatarPathOut,
+      avatar_bytes_size: avatarBytesSize,
+      fetched_at: localIso(),
+    };
+
+    processed++;
+    if (processed % 50 === 0) process.stdout.write(` ${processed}...`);
+    await sleep(50);
+  }
+
+  process.stdout.write(` ${processed} processed, ${downloaded} downloaded\n`);
+
+  const sendersPath = path.join(chatDir, "senders.json");
+  const tmpPath = sendersPath + ".tmp";
+  await fs.writeFile(tmpPath, JSON.stringify(sendersOut, null, 2));
+  await fs.rename(tmpPath, sendersPath);
+
+  return { processed, downloaded };
 }
 
 async function fetchTopics(client, entity) {
@@ -324,6 +474,18 @@ async function processChat(client, dialog, archived) {
     generated_at: localIso(),
   };
   await fs.writeFile(metaPath, JSON.stringify(metadata, null, 2));
+
+  try {
+    await enrichMessagesWithReactions(client, entity, messages);
+  } catch (e) {
+    console.log(`  warn: reaction enrichment failed for "${chatTitle}": ${e.message}`);
+  }
+
+  try {
+    await collectAndFetchSenders(client, messages, chatDir);
+  } catch (e) {
+    console.log(`  warn: sender/avatar collection failed for "${chatTitle}": ${e.message}`);
+  }
 
   if (isForum) {
     const byTopic = new Map();
