@@ -2,3 +2,6 @@
 video-maint/.fastembed_cache/
 video-maint/.uv-cache/
 video-maint/backups/
+
+# standalone nested repo (has its own .git + GitHub remote)
+immich-dng-extended/
